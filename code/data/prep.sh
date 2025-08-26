@@ -39,3 +39,4 @@ python s5_3D_to_2D.py --input /date/hao/PairedContrast/CT/low_256x256_2.5xD  \
 
 
 
+python s6_gen_2D_csv.py   --root /date/hao/PairedContrast/CT/low_256x256_2Dimension  --out files/2D_CT_pair.csv

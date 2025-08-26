@@ -23,6 +23,16 @@ CT_SUBFOLDERS = [
     "Uterus_Ovary_CT_train_val_test",
 ]
 
+HU_CLIP_BY_FOLDER = {
+    "Lung_CT_train_val_test": (-1000, 400),                  # lung window -> clip
+    "Adrenal_CT_train_val_test": (-100, 300),                # soft-tissue
+    "Bladder_Kidney_CT_train_val_test": (-135, 215),         # KiTS-style; good for renal parenchyma/tumor
+    "Stomach_Colon_Liver_Pancreas_CT_train_val_test": (-100, 300),  # general abdomen
+    "Uterus_Ovary_CT_train_val_test": (-100, 300),           # pelvic soft tissue
+}
+DEFAULT_HU_CLIP = (-100, 300)  # fallback
+
+
 Brain_MR_SUBFOLDERS = [
     "Breast_MR_train_val_test",
     # "Brain_MR_train_val_test",
@@ -58,17 +68,34 @@ def load_ras_img(path: Path) -> nib.Nifti1Image:
     img = nib.as_closest_canonical(img)
     return img
 
-def get_data_u8(img: nib.Nifti1Image, p_low=1.0, p_high=99.0) -> np.ndarray:
-    """Return uint8 volume after percentile windowing."""
+def get_data_u8(img: nib.Nifti1Image, clip: tuple[int, int] | None = None) -> np.ndarray:
+    """
+    Convert a CT volume (assumed in HU after rescale slope/intercept) to uint8.
+    If 'clip' is provided, apply HU clipping (min,max), then scale to [0,255].
+    If not provided, fall back to percentile windowing (1–99%).
+    """
     vol = img.get_fdata(dtype=np.float32)
-    finite = vol[np.isfinite(vol)]
-    if finite.size == 0:
-        return np.zeros(vol.shape, dtype=np.uint8)
-    lo, hi = np.percentile(finite, [p_low, p_high])
-    if hi <= lo:
-        hi = lo + 1.0
-    vol = np.clip((vol - lo) / (hi - lo), 0, 1)
-    return (vol * 255.0).astype(np.uint8)
+    vol[~np.isfinite(vol)] = 0
+
+    if clip is not None:
+        lo, hi = clip
+        if hi <= lo:
+            hi = lo + 1.0
+        vol = np.clip(vol, lo, hi)
+        vol = (vol - lo) / (hi - lo)
+    else:
+        # fallback percentile normalization
+        finite = vol[np.isfinite(vol)]
+        if finite.size == 0:
+            return np.zeros(vol.shape, dtype=np.uint8)
+        lo, hi = np.percentile(finite, [1.0, 99.0])
+        if hi <= lo:
+            hi = lo + 1.0
+        vol = np.clip((vol - lo) / (hi - lo), 0, 1)
+
+    return (np.clip(vol, 0, 1) * 255.0).astype(np.uint8)
+
+
 
 def middle_indices_xyz(shape):
     x, y, z = shape
@@ -179,8 +206,7 @@ def pad_to_tile(img: Image.Image, target_size: tuple) -> Image.Image:
     return canvas
 
 
-
-def process_ct_case(ct_path: Path, ctc_path: Path, out_dir: Path, case_name: str):
+def process_ct_case(ct_path: Path, ctc_path: Path, out_dir: Path, case_name: str, hu_clip: tuple[int, int]):
     try:
         ct_img  = load_ras_img(ct_path)
         ctc_img = load_ras_img(ctc_path)
@@ -188,38 +214,34 @@ def process_ct_case(ct_path: Path, ctc_path: Path, out_dir: Path, case_name: str
         print(f"[CT] Load fail {ct_path} or {ctc_path}: {e}", file=sys.stderr)
         return
 
-    # Resample CTC to CT’s grid if needed (shape/affine mismatch)
+    # Resample CTC to CT’s grid if needed
     if ctc_img.shape != ct_img.shape or not np.allclose(ctc_img.affine, ct_img.affine):
         try:
-            ctc_img = resample_from_to(ctc_img, (ct_img.shape, ct_img.affine), order=1)  # linear
+            ctc_img = resample_from_to(ctc_img, (ct_img.shape, ct_img.affine), order=1)
         except Exception as e:
             print(f"[CT] Resample fail {case_name}: {e}", file=sys.stderr)
             return
 
-    ct_u8  = get_data_u8(ct_img,  p_low=0, p_high=100)
-    ctc_u8 = get_data_u8(ctc_img, p_low=0, p_high=100)
-
-    print("ct_u8:", ct_u8.shape, ctc_u8.shape)
+    # >>> Organ-wise HU clipping <<<
+    ct_u8  = get_data_u8(ct_img,  clip=hu_clip)
+    ctc_u8 = get_data_u8(ctc_img, clip=hu_clip)
 
     ax_ct, co_ct, sa_ct = extract_middle_slices_xyz(ct_u8)
     ax_cc, co_cc, sa_cc = extract_middle_slices_xyz(ctc_u8)
 
-
-
-    # Label tiles so you know what you’re seeing
+    # Label tiles
     tile_size = (256, 256)
-
     row1 = [
         label_tile(pad_to_tile(to_pil(ax_ct), tile_size), "Axial CT"),
-        label_tile(pad_to_tile(to_pil(ax_cc), tile_size), "Axial CTC")
+        label_tile(pad_to_tile(to_pil(ax_cc), tile_size), "Axial CTC"),
     ]
     row2 = [
         label_tile(pad_to_tile(to_pil(co_ct), tile_size), "Coronal CT"),
-        label_tile(pad_to_tile(to_pil(co_cc), tile_size), "Coronal CTC")
+        label_tile(pad_to_tile(to_pil(co_cc), tile_size), "Coronal CTC"),
     ]
     row3 = [
         label_tile(pad_to_tile(to_pil(sa_ct), tile_size), "Sagittal CT"),
-        label_tile(pad_to_tile(to_pil(sa_cc), tile_size), "Sagittal CTC")
+        label_tile(pad_to_tile(to_pil(sa_cc), tile_size), "Sagittal CTC"),
     ]
 
     grid = make_grid([row1, row2, row3], tile_h=tile_size[1])
@@ -239,18 +261,34 @@ def run_ct(data_dir: Path, out_dir: Path):
             print(f"[CT] Missing folder: {root}", file=sys.stderr)
             continue
 
+        hu_clip = HU_CLIP_BY_FOLDER.get(sub, DEFAULT_HU_CLIP)
+
         case_to_files = defaultdict(list)
         for f in find_nifti_files(root):
             case_to_files[f.parent].append(f)
-
+        
+        id = 5
         for case_dir, files in case_to_files.items():
+            
+
             matched = match_by_keys(files, CT_KEYS)
             if not matched.get("ct") or not matched.get("ctc"):
                 continue
+
             ct_path  = sorted(matched["ct"])[0]
             ctc_path = sorted(matched["ctc"])[0]
             case_name = infer_case_name(ct_path)
-            process_ct_case(ct_path, ctc_path, out_dir, case_name)
+
+            # --- Organ-level output folder ---
+            organ_out_dir = out_dir / sub
+            process_ct_case(ct_path, ctc_path, organ_out_dir, case_name, hu_clip)
+
+            id -= 1
+            if id <= 0:
+                break
+
+
+
 
 # ----------------------------
 # Optional MRI viewer (unchanged logic, but RAS + correct axes)
@@ -293,6 +331,7 @@ def run_mri(data_dir: Path, out_dir: Path):
             seq_paths = {k: v for k, v in matched.items() if k in {"t1", "t1gd", "t2", "flair"}}
             if not seq_paths:
                 continue
+                
             process_mri_case(seq_paths, out_dir, case_dir.name)
 
 # ----------------------------

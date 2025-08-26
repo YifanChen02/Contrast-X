@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from utils import args, import_from_dotted_path, utils_metric
 from src import utils_usage
-
+from monai.losses import PerceptualLoss
 
 from src import init_autoencoder, KLDivergenceLoss, init_patch_discriminator, GradientAccumulation
 from utils.utils_image import save_image, pad_to_shape
@@ -44,17 +44,16 @@ accelerator = Accelerator()
 DEVICE = accelerator.device
 
 
+# Ratio to drop
+valid_ratio = 0  # All mask
+train_ratio = 0  # 0.5  # Half mask
+
+use_adv           = False
+use_standard_norm = False
+use_kl_loss       = True
+
+
 ACTIVATION_CLASSES = (nn.ReLU, nn.LeakyReLU, nn.ELU, nn.PReLU, nn.RReLU)
-
-def disable_inplace_activations(model: nn.Module):
-    for name, module in model.named_modules():
-        # print("Search : ", name, module.__class__.__name__, type(module), getattr(module, 'inplace', False))
-
-        if  getattr(module, 'inplace', False):
-            print("--> Disabling inplace activation in module: ", name, module.__class__.__name__)
-            module.inplace = False
-
-    return model
 
 
 def print_model_shapes(model, input_size):
@@ -110,6 +109,32 @@ def perform_broken_image(images, broken_channel, ratio=0.5):
     mask_images = images * mask 
     return mask_images, mask
 
+def standardize_per_sample_channel(images, eps=1e-6):
+    """
+    Standardize 5D tensor [B, C, H, W, D] per-sample, per-channel.
+    
+    Args:
+        images (Tensor): input tensor [B, C, H, W, D]
+        eps (float): numerical stability for std
+
+    Returns:
+        normed (Tensor): standardized tensor
+        means (Tensor): [B, C] mean values
+        stds (Tensor): [B, C] std values
+    """
+    # Flatten spatial dims to compute stats
+    B, C = images.shape[:2]
+    flat = images.view(B, C, -1)
+
+    means = flat.mean(dim=-1, keepdim=True)    # [B, C, 1]
+    stds = flat.std(dim=-1, keepdim=True)      # [B, C, 1]
+
+    normed = (flat - means) / (stds + eps)
+    normed = normed.view_as(images)            # back to [B, C, H, W, D]
+
+    return normed, means.squeeze(-1), stds.squeeze(-1)
+
+
 
 def validate_model(model, dataloader, device, image_save_root=None, max_batches=6,
                    step_name="", image_key="source", image_key_str=None):
@@ -138,13 +163,26 @@ def validate_model(model, dataloader, device, image_save_root=None, max_batches=
 
             # images = torch.cat(batch[image_key], dim=1).to(DEVICE)
             images = torch.cat([batch[key] for key in image_key], dim=1).to(DEVICE)
-            broken_images, mask = perform_broken_image(images,
+
+
+            if use_standard_norm:
+                images_norm, batch_means, batch_stds = standardize_per_sample_channel(images)
+                # batch_means, batch_stds are [B, C]
+            else:
+                images_norm = images.clone()
+
+            broken_images, mask = perform_broken_image(images_norm,
                                                        broken_channel=[1 if i in missing_modality else 0 for i in image_key],
-                                                       ratio=0.5)  # TODO learn with other target or not
-            # broken_images = broken_images.float()
+                                                       ratio=valid_ratio)  # TODO learn with other target or not
+
 
             with accelerator.autocast():
                 reconstruction, z_mu, z_sigma = model(broken_images)
+
+            if use_standard_norm:
+                # Denormalize later if needed
+                reconstruction = reconstruction * batch_stds[:, :, None, None, None] + batch_means[:, :, None, None, None]
+
 
             # Move to CPU for metrics and visualization
             image_np = images.cpu().numpy()
@@ -169,9 +207,9 @@ def validate_model(model, dataloader, device, image_save_root=None, max_batches=
                     recon = recon_mid[b]  # [4, H, W]
 
                     # Concatenate orig and recon for each of the 4 slices → [4, 2H, W]
-                    combined_slices = [np.concatenate([orig[i], recon[i]], axis=1) for i in range(image_mid.shape[1])]  # each is [H, 2W]
+                    combined_slices = [np.concatenate([orig[i], recon[i]], axis=0) for i in range(image_mid.shape[1])]  # each is [H, 2W]
 
-                    combined = np.concatenate(combined_slices, axis=0)  # [4H, 2W]
+                    combined = np.concatenate(combined_slices, axis=1)  # [4H, 2W]
 
                     save_path = os.path.join(image_save_root, f"{step_name}_img_{idx}_{b}.jpg")
                     save_image(save_path, combined)
@@ -184,7 +222,10 @@ message = ""
 missing_modality = args.missing_modality
 
 if __name__ == '__main__':
+
+
     image_key = args.input_modality
+
     
     # Image
     image_save_root = "./image_result/step1_ae_train/"
@@ -203,12 +244,15 @@ if __name__ == '__main__':
     # ---------------- Define Dataloader ----------------
     in_channels = len(image_key)  # 4 channels:
     dimension = 3
-    spatial_size = (96, 96, 64)  # (128, 128, 128)
-    
+    spatial_size = (96, 96, 64)  # (256, 256, 64)
+    # spatial_size = (48, 48, 32)  # (256, 256, 64)
+
     key_to_load  = []          # ["mask", "density"]
     key_to_load.extend(image_key)
 
-    train_loader     = get_ct_dataloader(args, mode="train", batch_size=args.batch_size,
+    # print("cache_dir=", args.cache_dir )
+
+    train_loader     = get_ct_dataloader(args, mode=["train", "test", "val"], batch_size=args.batch_size,
                                             spatial_size=spatial_size, key_to_load=key_to_load, cache_dir=args.cache_dir)
     test_loader      = get_ct_dataloader(args, mode="test",  batch_size=args.batch_size,
                                             spatial_size=spatial_size, key_to_load=key_to_load, cache_dir=args.cache_dir)
@@ -221,7 +265,43 @@ if __name__ == '__main__':
 
     discriminator = init_patch_discriminator(args.disc_ckpt, spatial_dims=dimension,
                                              in_channels=in_channels, num_layers_d=3).to(DEVICE)
-    discriminator = disable_inplace_activations(discriminator)
+ 
+
+
+    random_init = False
+
+    def weights_init(m):
+        """Custom init: Conv3d/TransposeConv3d = Kaiming, Linear = Xavier, BatchNorm = (1,0), everything else = Kaiming if possible."""
+        if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
+            nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+        elif isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+
+        else:
+            # Fallback: if it has weights, apply kaiming; if bias, set to zero
+            if hasattr(m, "weight") and m.weight is not None:
+                if m.weight.dim() > 1:  # safe for Conv, Linear, etc.
+                    nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+                else:  # 1D weights -> Normal(0, 0.02)
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if hasattr(m, "bias") and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+
+
+    if random_init:
+        autoencoder.apply(weights_init)
+        print("Autoencoder randomly initialized (no pretrained weights).")
+
 
 
     def remove_module_prefix(state_dict):
@@ -251,20 +331,22 @@ if __name__ == '__main__':
 
     adv_weight        = 0.025
     perceptual_weight = 0.001
-    kl_weight         = 1e-7
+    kl_weight         = 1e-7  # 1e-7
 
     l1_loss_fn  = L1Loss()
     kl_loss_fn  = KLDivergenceLoss()
     adv_loss_fn = PatchAdversarialLoss(criterion="least_squares")
-    adv_loss_fn = disable_inplace_activations(adv_loss_fn)
+    # adv_loss_fn = disable_inplace_activations(adv_loss_fn)
     adv_loss_fn.activation = torch.nn.LeakyReLU(negative_slope=0.05, inplace=False)  # <- safe
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        perc_loss_fn = PerceptualLoss(spatial_dims=dimension,
+        perc_loss_fn = PerceptualLoss(spatial_dims=3,
                                       network_type="squeeze",
                                       is_fake_3d=True,
                                       fake_3d_ratio=0.2).to(DEVICE)
+
+
 
     trainable = [p for n, p in autoencoder.named_parameters() if p.requires_grad]
     all_sum = sum(p.numel() for p in autoencoder.parameters())
@@ -272,16 +354,16 @@ if __name__ == '__main__':
     trainable_sum = sum(p.numel() for p in autoencoder.parameters() if p.requires_grad)
     print(f"\nTrainable parameters: {trainable_sum / 1e6:.2f} M")
 
-    optimizer_g = torch.optim.Adam(trainable, lr=args.lr)
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=args.lr)
+    optimizer_g = torch.optim.AdamW(trainable, lr=args.lr)
+    optimizer_d = torch.optim.AdamW(discriminator.parameters(), lr=args.lr)
 
     avgloss = utils_usage.AverageLoss()
     writer  = SummaryWriter()
     total_counter = 0
 
     # ---------------- Prepare for Training ----------------
-    autoencoder, discriminator, optimizer_g, optimizer_d, train_loader, adv_loss_fn = accelerator.prepare(
-        autoencoder, discriminator, optimizer_g, optimizer_d, train_loader, adv_loss_fn
+    autoencoder, discriminator, optimizer_g, optimizer_d, train_loader, adv_loss_fn, perc_loss_fn = accelerator.prepare(
+        autoencoder, discriminator, optimizer_g, optimizer_d, train_loader, adv_loss_fn, perc_loss_fn
     )
 
     # Test at starter
@@ -289,6 +371,7 @@ if __name__ == '__main__':
                    image_save_root=None, max_batches=6, step_name="Start",
                    image_key=image_key, image_key_str=image_key_str)
 
+    
     for epoch in range(args.n_epochs):
 
         if DEVICE == "cuda":
@@ -299,82 +382,126 @@ if __name__ == '__main__':
         autoencoder.train()
         discriminator.train()
 
+        # print(" len(train_loader)=", len(train_loader))
+
+
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader))
         progress_bar.set_description(f'Epoch {epoch}')
 
+
         for step, batch in progress_bar:
+            optimizer_g.zero_grad(set_to_none=True)
+
             if args.DEBUG and step >= 5:
                 break
 
-            images = torch.cat([batch[key] for key in image_key], dim=1).to(DEVICE)
-            # mask   = batch["mask"].to(DEVICE)
+            if step > 50:
+                break
 
-            # Mask
-            broken_images, mask = perform_broken_image(images,
-                                        broken_channel=[1 if i in missing_modality else 0 for i in image_key], ratio=0.5)
+            images = torch.cat([batch[key] for key in image_key], dim=1).to(DEVICE)
+
+            # print("images stat:", images.min(), images.max())
+
+
+            if use_standard_norm:
+                images_norm, batch_means, batch_stds = standardize_per_sample_channel(images.clone())
+                # batch_means, batch_stds are [B, C]
+            else:
+                images_norm = images.clone()
+
+            broken_images, mask = perform_broken_image(images_norm,
+                                        broken_channel=[1 if i in missing_modality else 0 for i in image_key], ratio=train_ratio)
+
+
 
             # with autocast(enabled=True):
             with accelerator.autocast():
                 reconstruction, z_mu, z_sigma = autoencoder(broken_images)  # Masked
-                logits_fake = discriminator(reconstruction.contiguous())[-1]
+                if use_adv:
+                    logits_fake = discriminator(reconstruction.contiguous())[-1]
+                    gen_loss = adv_weight * adv_loss_fn(logits_fake, target_is_real=True, for_discriminator=False)
+                else:
+                    gen_loss = torch.tensor(0).to(reconstruction.device)
+
 
                 if not use_mask_loss:
-                    rec_loss = l1_loss_fn(reconstruction, images)
+                    rec_loss = l1_loss_fn(reconstruction, images) * 5
+
                 else:
-                    mask = mask.repeat(mask.shape[0], *images.shape[1:])
+                    mask = mask.expand_as(images)
+                    # mask = mask.repeat(mask.shape[0], *images.shape[1:])
                     rec_loss = torch.abs(reconstruction * mask - images * mask).sum() / torch.sum(mask)
 
                 kld_loss = kl_weight * kl_loss_fn(z_mu, z_sigma)
+                
+                perceptual_weight = 0.001
 
-                # Make sure mask is boolean and same device
-                gen_loss = adv_weight * adv_loss_fn(logits_fake, target_is_real=True, for_discriminator=False)
-                loss_g = rec_loss + kld_loss + gen_loss  # + per_loss
+                zero_channel = torch.zeros(
+                    (reconstruction.shape[0], 1, *reconstruction.shape[2:]),
+                    device=reconstruction.device,
+                    dtype=reconstruction.dtype
+                ).detach()
+
+                # concatenate along channel dim (dim=1)
+                reconstruction_3ch = torch.cat([reconstruction, zero_channel], dim=1)
+                images_3ch         = torch.cat([images,         zero_channel], dim=1)
+
+                per_loss = perceptual_weight * perc_loss_fn(reconstruction_3ch.float(), images_3ch.float().detach())
+   
+
+                loss_g = rec_loss + kld_loss + gen_loss + per_loss
 
                 progress_bar.set_postfix(loss_g=loss_g.item() if hasattr(loss_g, "item") else loss_g,
+                                         per_loss=per_loss.item() if hasattr(loss_g, "item") else per_loss,
                                          rec_loss=rec_loss.item() if hasattr(rec_loss, "item") else rec_loss,
                                          kld_loss=kld_loss.item() if hasattr(kld_loss, "item") else kld_loss,
                                          gen_loss=gen_loss.item() if hasattr(gen_loss, "item") else gen_loss)
 
+            
+            optimizer_g.zero_grad(set_to_none=True)
             accelerator.backward(loss_g)
             optimizer_g.step()
-            optimizer_g.zero_grad()
+            
+
+            del z_mu, z_sigma, loss_g
+  
 
 
             # ⚠️ This is a workaround, but should be improved
-            with accelerator.autocast():
-                fake_images = reconstruction.detach()  # Detach to cut generator graph
-                logits_real = discriminator(images.contiguous())[-1]   # .contiguous().detach()
-                d_loss_real = adv_loss_fn(logits_real, target_is_real=True, for_discriminator=True)
+            if use_adv:
+                with accelerator.autocast():
+                    fake_images = reconstruction.detach()  # Detach to cut generator graph
+                    logits_real = discriminator(images.contiguous())[-1]   # .contiguous().detach()
+                    d_loss_real = adv_loss_fn(logits_real, target_is_real=True, for_discriminator=True)
 
-                discriminator_loss = (d_loss_real) * 0.5
-                loss_d = adv_weight * discriminator_loss
+                    discriminator_loss = (d_loss_real) * 0.5
+                    loss_d = discriminator_loss
 
-            optimizer_d.zero_grad()
-            accelerator.backward(loss_d)
+                optimizer_d.zero_grad()
+                accelerator.backward(loss_d)
+
+                del logits_real, loss_d
+          
+                with accelerator.autocast():
+                    fake_images = reconstruction.detach()  # Detach to cut generator graph
+                    logits_fake = discriminator(fake_images.contiguous())[-1]
+                    d_loss_fake = adv_loss_fn(logits_fake, target_is_real=False, for_discriminator=True)
+
+                    discriminator_loss = (d_loss_fake) * 0.5
+                    loss_d1 = discriminator_loss
+
+                # optimizer_d.zero_grad()
+                accelerator.backward(loss_d1)
+                optimizer_d.step()
+                optimizer_d.zero_grad()
+
+                del logits_fake, loss_d1, reconstruction, fake_images
 
 
-            with accelerator.autocast():
-                fake_images = reconstruction.detach()  # Detach to cut generator graph
-                logits_fake = discriminator(fake_images.contiguous())[-1]
-                d_loss_fake = adv_loss_fn(logits_fake, target_is_real=False, for_discriminator=True)
-
-                discriminator_loss = (d_loss_fake) * 0.5
-                loss_d = adv_weight * discriminator_loss
-
-            # optimizer_d.zero_grad()
-            accelerator.backward(loss_d)
-            optimizer_d.step()
-            optimizer_d.zero_grad()
+                torch.cuda.empty_cache()
+         
 
 
-
-            avgloss.put('Generator/reconstruction_loss', rec_loss.item())
-            # avgloss.put('Generator/perceptual_loss', per_loss.item())
-            avgloss.put('Generator/adverarial_loss', gen_loss.item())
-            avgloss.put('Generator/kl_regularization', kld_loss.item())
-            avgloss.put('Discriminator/adverarial_loss', loss_d.item())
-
-            total_counter += 1
 
         _image_save_root = f"{image_save_root}/epoch_{epoch}"
         os.makedirs(_image_save_root, exist_ok=True)

@@ -27,7 +27,7 @@ from monai.transforms import Compose, SaveImage
 from monai.utils import set_determinism
 from tqdm import tqdm
 from monai.inferers.inferer import SlidingWindowInferer
-from monai.networks.schedulers import RFlowScheduler, DDPMScheduler
+from monai.schedulers import RFlowScheduler, DDPMScheduler
 
 from .augmentation import augmentation
 from .find_masks import find_masks

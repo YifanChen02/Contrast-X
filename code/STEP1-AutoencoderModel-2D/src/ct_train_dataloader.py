@@ -17,8 +17,12 @@ from monai import transforms as trans
 
 def get_dataframe(args, mode):
     dataset_df = pd.read_csv(args.dataset_csv)
-    print("length of dataset_df: ", len(dataset_df))
-    df = dataset_df[dataset_df['Splits'] == mode]
+    
+    if isinstance(mode, list):
+        df = dataset_df[dataset_df['Splits'].isin(mode)]
+    else:
+        df = dataset_df[dataset_df['Splits'] == mode]
+
     if args.DEBUG:
         df = df[:10]
 
@@ -34,12 +38,14 @@ def get_ct_dataloader(args,
     
 
     image_keys = args.input_modality  # "ct", "ctc"   # [k for k in key_to_load if k != "mask" and k != "patient_id"]
-    # image_keys = [i.upper() for i in image_keys]
+  
     print("cache_dir:", cache_dir)
     print("Read in List with Keys=", datalist.keys())
     print("Input Modality: ", image_keys, key_to_load)
 
     datalist = datalist.to_dict(orient='records')
+
+    print(f"length of {mode} dataset_df: ", len(datalist))
 
     crop_transform = RandCropByPosNegLabeld(
         keys=key_to_load,
@@ -59,23 +65,24 @@ def get_ct_dataloader(args,
         random_size=False        # fixed size
     )
 
-    
-
-            # EnsureTypeD(keys=imagekeys, dtype="float32"),
-            # LambdaD(keys=imagekeys, func=lambda x: x.clone()),
-
-            
-
-    RESOLUTION = (1.5, 1.5, 1.5)
-    # RESOLUTION = (2.0, 2.0, 2.0)
     # Define transforms
     transforms = [
         
         LoadImaged(keys=key_to_load),
         EnsureChannelFirstd(keys=key_to_load),
         Orientationd(keys=key_to_load, axcodes="RAS"),
+
+        # 
+        trans.ScaleIntensityRanged(   # -1000 -> 1000
+            keys=image_keys,
+            a_min=-1000,
+            a_max=1000,
+            b_min=0.0,
+            b_max=1.0,
+            clip=True,
+        ),
+
         ScaleIntensityD(minv=0, maxv=1, keys=image_keys),  # Normalize all but mask
-        
 
         crop_transform,
         ResizeWithPadOrCropd(
@@ -97,37 +104,19 @@ def get_ct_dataloader(args,
             trans.RandFlipD(prob=0.5, spatial_axis=0, keys=image_keys),
             trans.RandFlipD(prob=0.5, spatial_axis=1, keys=image_keys),
             trans.RandFlipD(prob=0.5, spatial_axis=2, keys=image_keys),
-
-
-            trans.RandAffineD(
-                keys=image_keys,
-                prob=0.5,
-                rotate_range=(0.15, 0.15, 0.15),
-                # translate_range=(8, 8, 8),          # voxels
-                scale_range=(0.1, 0.1, 0.1),        # +/-10%
-                shear_range=(0.05, 0.05, 0.05),
-                # mode="bilinear",  # {"image": "bilinear", "label": "nearest"} if labelkeys else 
-                padding_mode=padding_mode,
-            ),
             
-            # elastic (smooth nonrigid; great for anatomy)
-
-            # transforms.Rand3DElasticD(
-            #     keys=imagekeys,
-            #     prob=0.3, sigma_range=(3, 5), magnitude_range=(2, 5),
-            #     mode="bilinear",  # {"image": "bilinear", "label": "nearest"} if labelkeys else 
-            #     padding_mode=padding_mode,
-            #     # as_tensor_output=False
-            # ),
-
-            trans.EnsureTypeD(keys=image_keys, dtype="float32"),
+            trans.RandGaussianNoised(keys=image_keys, prob=0.2, mean=0.0, std=0.01),
+            trans.RandAdjustContrastd(keys=image_keys, prob=0.3, gamma=(0.7, 1.5)),
+            
 
         ])
+
+    transforms.extend( [trans.EnsureTypeD(keys=image_keys, dtype="float32")] )
 
     transforms = Compose(transforms)
 
     # Create dataset and dataloader
     dataset    = PersistentDataset(data=datalist, transform=transforms, cache_dir=cache_dir)
     dataloader = DataLoader(dataset, batch_size=batch_size,
-                            shuffle=(mode=="train"),  num_workers=4)
+                            shuffle=(mode=="train"),  num_workers=8)
     return dataloader

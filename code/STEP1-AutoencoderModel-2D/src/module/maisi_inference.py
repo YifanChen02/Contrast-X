@@ -130,7 +130,7 @@ with torch.no_grad():
     recon = autoencoder.decode(latent[0])
 
 
-print("args.autoencoder_sliding_window_infer_size, ", args.autoencoder_sliding_window_infer_size)
+print("args.autoencoder_sliding_window_infer_size, ",    args.autoencoder_sliding_window_infer_size)
 print("args.autoencoder_sliding_window_infer_overlap, ", args.autoencoder_sliding_window_infer_overlap)
 
 # print("args.autoencoder_sliding_window_infer_mode, ", args.autoencoder_sliding_window_infer_mode)
