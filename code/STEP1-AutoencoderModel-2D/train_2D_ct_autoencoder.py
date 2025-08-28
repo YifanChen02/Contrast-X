@@ -52,7 +52,7 @@ valid_ratio = 0  # All mask
 train_ratio = 0  # 0.5  # Half mask
 
 use_standard_norm = True # use_standard_norm
-use_broken        = False
+use_broken        = args.use_broken  # True
 
 ACTIVATION_CLASSES = (nn.ReLU, nn.LeakyReLU, nn.ELU, nn.PReLU, nn.RReLU)
 
@@ -170,105 +170,116 @@ def batch_psnr_ssim(imgs1: np.ndarray, imgs2: np.ndarray, data_range=1.0):
     return psnr_vals, ssim_vals
 
 
+
+
 def validate_model(model, dataloader, device, image_save_root=None, max_batches=6,
                    step_name="", image_key="source", image_key_str=None):
     model.eval()
     if image_save_root is not None:
         os.makedirs(image_save_root, exist_ok=True)
 
-    avg_psnr, avg_ssim = [], []
+    # metrics for "reconstruction" (zeroed modality input)
+    avg_psnr_ctc, avg_ssim_ctc = [], []
+    avg_psnr_ct, avg_ssim_ct   = [], []
 
-    # Print the model architecture, and the input and output channel sizes of each layer
-    DEBUG = False
-    if DEBUG:
-        print("Model architecture:\n")
-        print(model)  # Print full model
-
-        print("\nLayer-wise input and output shapes:")
-        print_model_shapes(model, input_size=(2, len(image_key), 96, 96, 96))
-
+    # metrics for "clean reconstruction" (full modality input)
+    avg_psnr_clean_ctc, avg_ssim_clean_ctc = [], []
+    avg_psnr_clean_ct, avg_ssim_clean_ct   = [], []
+    
     with torch.no_grad():
         for idx, batch in enumerate(dataloader):
 
             if args.DEBUG and idx >= 5:
                 break
-
             if idx >= max_batches:
                 break
 
+            ct   = batch['CT'].to(device)
+            ctc  = batch['CTC'].to(device)
+            images = torch.cat([ct, ctc], dim=1)
 
-            # images = torch.cat(batch[image_key], dim=1).to(DEVICE)
-            ct           = batch['CT'].to(DEVICE)
-            ctc          = batch['CTC'].to(DEVICE)
-            images       = torch.cat([ct, ctc], dim=1)
-            zero_ctc     = torch.zeros_like(ctc)
-
+            zero_ctc = torch.zeros_like(ctc).to(device)
+            one_ctc  = torch.ones_like(ctc).to(device)
 
             if use_standard_norm:
-                ct, ct_mean, ct_std   = standard_normalize(ct)
-                ctc, ctc_mean, ctc_std = standard_normalize(ctc)   
+                ct, ct_mean, ct_std     = standard_normalize(ct.clone()  )
+                ctc, ctc_mean, ctc_std  = standard_normalize(ctc.clone() )
 
             if use_broken:
-                input_images = torch.cat([ct, zero_ctc], dim=1)
+                input_images = torch.cat([ct, zero_ctc, one_ctc, zero_ctc], dim=1)
             else:
-                input_images = torch.cat([ct, ctc], dim=1)
-
-
-            
+                input_images = torch.cat([ct, ctc, one_ctc, one_ctc], dim=1)
+                
+            clean_images = torch.cat([ct, ctc, one_ctc, one_ctc], dim=1)
             with accelerator.autocast():
-                # reconstruction, z_mu, z_sigma = model(input_images)
+                # full modality reconstruction
+                clean_recon = autoencoder(clean_images).sample
+                # partial input reconstruction
                 out = autoencoder(input_images)
                 reconstruction = out.sample
 
             if use_standard_norm:
-                recon_ct_norm  = reconstruction[:, 0:1]#.unsqueeze(1)   # (B,1,H,W)
-                recon_ctc_norm = reconstruction[:, 1:2]#.unsqueeze(1)    # (B,1,H,W)
-                # print("ct_mean=", ct_mean.shape)
+                # --- partial recon ---
+                recon_ct_norm   = reconstruction[:, 0:1]
+                recon_ctc_norm  = reconstruction[:, 1:2]
+                recon_ct        = denormalize(recon_ct_norm, ct_mean, ct_std)
+                recon_ctc       = denormalize(recon_ctc_norm, ctc_mean, ctc_std)
+                reconstruction  = torch.cat([recon_ct, recon_ctc], dim=1)
 
-                # Denormalize each branch (dims match because mean/std are (B,1,1,1))
-                recon_ct  = denormalize(recon_ct_norm, ct_mean, ct_std)
-                recon_ctc = denormalize(recon_ctc_norm, ctc_mean, ctc_std)
+                # --- clean recon ---
+                clean_ct_norm   = clean_recon[:, 0:1]
+                clean_ctc_norm  = clean_recon[:, 1:2]
+                clean_ct        = denormalize(clean_ct_norm, ct_mean, ct_std)
+                clean_ctc       = denormalize(clean_ctc_norm, ctc_mean, ctc_std)
+                clean_recon     = torch.cat([clean_ct, clean_ctc], dim=1)
 
-                # Final reconcat
-                reconstruction = torch.cat([recon_ct, recon_ctc], dim=1)  # (B,2,H,W)
+            # Move to CPU for metrics
+            image_np       = images.cpu().numpy()
+            recon_np       = reconstruction.cpu().numpy()
+            clean_recon_np = clean_recon.cpu().numpy()
 
+            # ---- metrics for "broken input" reconstruction ----
+            psnr_ct, ssim_ct = batch_psnr_ssim(image_np[:, 0:1], recon_np[:, 0:1], data_range=1.0)
+            avg_psnr_ct.append(psnr_ct)
+            avg_ssim_ct.append(ssim_ct)
 
-            # Move to CPU for metrics and visualization
-            image_np = images.cpu().numpy()
-            recon_np = reconstruction.cpu().numpy()
+            psnr_ctc, ssim_ctc = batch_psnr_ssim(image_np[:, 1:2], recon_np[:, 1:2], data_range=1.0)
+            avg_psnr_ctc.append(psnr_ctc)
+            avg_ssim_ctc.append(ssim_ctc)
 
+            # ---- metrics for "clean full input" reconstruction ----
+            psnr_clean_ct, ssim_clean_ct = batch_psnr_ssim(image_np[:, 0:1], clean_recon_np[:, 0:1], data_range=1.0)
+            avg_psnr_clean_ct.append(psnr_clean_ct)
+            avg_ssim_clean_ct.append(ssim_clean_ct)
 
-            # Example usage:
-            # image_np, recon_np = (2, 2, 96, 96)
+            psnr_clean_ctc, ssim_clean_ctc = batch_psnr_ssim(image_np[:, 1:2], clean_recon_np[:, 1:2], data_range=1.0)
+            avg_psnr_clean_ctc.append(psnr_clean_ctc)
+            avg_ssim_clean_ctc.append(ssim_clean_ctc)
 
-            # print("image_np stat = ", image_np.shape, recon_np.shape)
-
-
-            psnr_val, ssim_val = batch_psnr_ssim(image_np, recon_np, data_range=1.0)
-
-
-            avg_psnr.append(psnr_val)
-            avg_ssim.append(ssim_val)
-
-            # Save middle slice comparison image
-     
-            image_mid = image_np #[:, :, :, :, middle_slice]  # B, C, H, W
-            recon_mid = recon_np #[:, :, :, :, middle_slice]
-            
+            # ---- save images if needed ----
             if image_save_root is not None:
-                for b in range(image_mid.shape[0]):
-                    orig  = image_mid[b]  # [4, H, W]
-                    recon = recon_mid[b]  # [4, H, W]
+                for b in range(image_np.shape[0]):
+                    orig  = image_np[b]
+                    recon = recon_np[b]
+                    clean = clean_recon_np[b]
 
-                    # Concatenate orig and recon for each of the 4 slices → [4, 2H, W]
-                    combined_slices = [np.concatenate([orig[i], recon[i]], axis=0) for i in range(image_mid.shape[1])]  # each is [H, 2W]
-
-                    combined = np.concatenate(combined_slices, axis=1)  # [4H, 2W]
+                    combined_slices = []
+                    for i in range(image_np.shape[1]):
+                        combined_slices.append(
+                            np.concatenate([orig[i], recon[i], clean[i]], axis=0)  # orig | broken-recon | clean-recon
+                        )
+                    combined = np.concatenate(combined_slices, axis=1)
 
                     save_path = os.path.join(image_save_root, f"{step_name}_img_{idx}_{b}.jpg")
                     save_image(save_path, combined)
 
-    print(f"{step_name} - AVG_PSNR: {np.mean(avg_psnr):.2f}, AVG_SSIM: {np.mean(avg_ssim):.4f}")
+    # ---- final logs ----
+    print(f"{step_name} - CT   AVG_PSNR: {np.mean(avg_psnr_ct):.2f},  AVG_SSIM: {np.mean(avg_ssim_ct):.4f}")
+    print(f"{step_name} - CTC  AVG_PSNR: {np.mean(avg_psnr_ctc):.2f}, AVG_SSIM: {np.mean(avg_ssim_ctc):.4f}")
+    print(f"{step_name} - CLEAN CT   AVG_PSNR: {np.mean(avg_psnr_clean_ct):.2f},  AVG_SSIM: {np.mean(avg_ssim_clean_ct):.4f}")
+    print(f"{step_name} - CLEAN CTC  AVG_PSNR: {np.mean(avg_psnr_clean_ctc):.2f}, AVG_SSIM: {np.mean(avg_ssim_clean_ctc):.4f}")
+
+
 
 
 message = ""
@@ -277,7 +288,7 @@ missing_modality = args.missing_modality
 
 
 
-def define_2DAE(inchannel=3, latent_channels = 16):
+def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
     from huggingface_hub import snapshot_download
     from diffusers import AutoencoderKL
 
@@ -301,16 +312,25 @@ PY
 
     
     from diffusers.models import AutoencoderKL
-    in_channels = 2
-    
+
+    block_out_channels=(256, 512)
+    layers_per_block = 3
+
+    # block_out_channels=(256, 256, 512) # 128, 256
+    # layers_per_block = 2
+
+    n_blocks = len(block_out_channels)
+
     vae = AutoencoderKL(
-        in_channels=in_channels, out_channels=in_channels, latent_channels=16,
-        block_out_channels=(128, 256),  # (128, 256),(256, 512) # 2 blocks -> ×4 total downsample
-        down_block_types=("DownEncoderBlock2D","DownEncoderBlock2D"),
-        up_block_types=("UpDecoderBlock2D","UpDecoderBlock2D"),
-        layers_per_block=3, 
+        in_channels=in_channels, out_channels=out_channels, latent_channels=latent_channels,
+        block_out_channels=block_out_channels, 
+        down_block_types=("DownEncoderBlock2D",) * n_blocks,
+        up_block_types=("UpDecoderBlock2D",) * n_blocks,
+        layers_per_block=layers_per_block,   # 3
         norm_num_groups=32
     )
+
+
 
     return vae
 
@@ -321,8 +341,6 @@ PY
     vae = AutoencoderKL.from_pretrained("/date/hao/models/sd-vae-ft-ema")  # , local_files_only=True)
     # vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema", force_upcast=True)        # , subfolder=subfolder)
     # vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-v1-5", force_upcast=True)     # , subfolder="vae")
-
-    
 
     # vae.config.latent_channels = 16  
 
@@ -500,8 +518,9 @@ if __name__ == '__main__':
 
 
     # ---------------- Define AutoEncoder Model ----------------
-    # define_2DAE(inchannel=3, latent_channels = 16)
-    autoencoder   = define_2DAE(in_channels, latent_channels = 16).to(DEVICE).float()
+    autoencoder   = define_2DAE(in_channels=in_channels * 2, 
+                                out_channels=in_channels,
+                                latent_channels = 16).to(DEVICE).float()
 
 
     discriminator = init_patch_discriminator(args.disc_ckpt, 
@@ -521,8 +540,8 @@ if __name__ == '__main__':
         return new_state_dict
 
     if args.resume:
-        dis_path = os.path.join(args.output_dir, f'dis-{args.resume}.pth')
-        gen_path = os.path.join(args.output_dir, f'ae-{args.resume}.pth')
+        dis_path = os.path.join(args.output_dir, f'dis-{args.resume}-{image_key_str}.pth')
+        gen_path = os.path.join(args.output_dir, f'ae-{args.resume}-{image_key_str}.pth')
         if os.path.exists(dis_path):
             discriminator.load_state_dict(remove_module_prefix(torch.load(dis_path)))
         else:
@@ -603,17 +622,23 @@ if __name__ == '__main__':
     )
 
     # Test at starter
-    validate_model(autoencoder, test_loader, DEVICE,
+    if accelerator.is_main_process:
+        validate_model(autoencoder, test_loader, DEVICE,
                    image_save_root=None, max_batches=6, step_name="Start",
                    image_key=image_key, image_key_str=image_key_str)
 
-    
-    for epoch in range(args.n_epochs):
+    start_epoch = 0
+
+    if args.resume:
+        start_epoch = int(args.resume)
+
+
+    for epoch in range(start_epoch, args.n_epochs-start_epoch):
 
         if DEVICE == "cuda":
             print("EPOCH: ", epoch)
             print(f"Allocated GPU memory: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB")
-            print(f"Cached GPU memory:    {torch.cuda.memory_reserved() / 1024 ** 2:.2f} MB")
+            print(f"Cached GPU memory:    {torch.cuda.memory_reserved()  / 1024 ** 2:.2f} MB")
 
         autoencoder.train()
         discriminator.train()
@@ -631,7 +656,7 @@ if __name__ == '__main__':
             if args.DEBUG and step >= 5:
                 break
 
-            if step > 250:
+            if step > 100:  # 390
                 break
 
             ct    = batch['CT'].to(DEVICE)
@@ -643,21 +668,23 @@ if __name__ == '__main__':
 
             # print("CT stat:",  ct.min(), ct.max(), ct.mean())
             # print("CTC stat:", ctc.min(), ctc.max(), ctc.mean())
- 
-            images = torch.cat([ct, ctc], dim=1)
-
-            B, C, H, W = images.shape
-            if np.random.rand() < 0.5:
-                mask_out = torch.zeros((B, 1, 1, 1), device=images.device)  # shape (B,1,1,1)
-                ctc_in = mask_out * ctc.clone()
-            else:
-                ctc_in = ctc.clone()
+            zero_ctc     = torch.zeros_like(ctc).to(DEVICE)
+            one_ctc      = torch.ones_like(ctc).to(DEVICE)
 
             if use_broken:
-                input_images = torch.cat([ct, ctc_in], dim=1)
-            else:
-                input_images = torch.cat([ct, ctc], dim=1)
+                input_ct_ctc     = torch.cat([ct, ctc, one_ctc, one_ctc], dim=1)
+                if np.random.rand() < 0.5:
+                    input_ct         = torch.cat([ct, zero_ctc, one_ctc, zero_ctc], dim=1)
+                else:
+                    input_ct         = torch.cat([zero_ctc, ctc, zero_ctc, one_ctc], dim=1)
 
+                input_images     = torch.cat([input_ct, input_ct_ctc], dim=0)         # This is Input
+                images           = torch.cat([torch.cat([ct, ctc], dim=1), 
+                                            torch.cat([ct, ctc], dim=1)], dim=0)    # This is Target
+
+            else:
+                input_images     = torch.cat([ct, ctc, one_ctc, one_ctc], dim=1)
+                images           = torch.cat([ct, ctc], dim=1)
 
 
             # with autocast(enabled=True):
@@ -666,13 +693,13 @@ if __name__ == '__main__':
                 enc_out = autoencoder.encode(input_images)   # EncodeOutput
                 z_dist  = enc_out.latent_dist                # Normal distribution
 
-                use_sample_training = True #False
+                use_sample_training = True   #False
 
                 # latent mean & std
                 z_mu    = z_dist.mean
                 z_sigma = z_dist.std
 
-                # Reparameterize (sample z)
+
                 if use_sample_training:
                     z       = z_dist.sample()
                 else:
@@ -701,6 +728,7 @@ if __name__ == '__main__':
             
                 B, C, H, W = reconstruction.shape
 
+
                 # --------------- Perceptural Loss ---------------
                 # Split into CT and CTC
                 recon_ct,  recon_ctc  = reconstruction[:,0:1], reconstruction[:,1:2]  # [B,1,H,W]
@@ -724,14 +752,51 @@ if __name__ == '__main__':
                     images_3ch.float().detach()
                 )
 
+                # Latent Alignment
+                z_mu_ct, z_mu_ctc   = torch.chunk(z_dist.mean, 2, dim=0)
+                z_std_ct, z_std_ctc = torch.chunk(z_dist.std, 2, dim=0)
+                
 
-                loss_g = rec_loss + kld_loss + gen_loss + per_loss
+                def kl_gaussians(mu1, std1, mu2, std2, weight=1e-4, eps=1e-6):
+                    """
+                    KL divergence KL(q1||q2) between two diagonal Gaussians.
+                    Uses log-variance for stability.
+                    mu1, std1, mu2, std2: (B, D, ...)
+                    """
+                    # use log-variance to avoid squaring large/small numbers
+                    logvar1 = (std1.clamp(min=eps)).log() * 2
+                    logvar2 = (std2.clamp(min=eps)).log() * 2
 
-                progress_bar.set_postfix(loss_g=loss_g.item() if hasattr(loss_g, "item") else loss_g,
-                                         per_loss=per_loss.item() if hasattr(loss_g, "item") else per_loss,
-                                         rec_loss=rec_loss.item() if hasattr(rec_loss, "item") else rec_loss,
-                                         kld_loss=kld_loss.item() if hasattr(kld_loss, "item") else kld_loss,
-                                         gen_loss=gen_loss.item() if hasattr(gen_loss, "item") else gen_loss)
+                    var1 = logvar1.exp()
+                    var2 = logvar2.exp()
+
+                    # KL(q1||q2) closed form
+                    weights = 1e-2
+                    kl = weight * (
+                        (var1 / var2)
+                        + (mu2 - mu1).pow(2) / var2
+                        - 1
+                        + (logvar2 - logvar1)
+                    )
+
+                    # flatten across latent dims, then sum per-sample
+                    kl = kl.flatten(1).sum(1)
+                    return weight * kl.mean()
+
+                if use_broken:
+                    loss_latent = kl_gaussians(z_mu_ct, z_std_ct, z_mu_ctc.detach(), z_std_ctc.detach())
+                else:
+                    loss_latent = torch.tensor(0)
+
+
+                loss_g = rec_loss + kld_loss + gen_loss + per_loss + loss_latent
+
+                progress_bar.set_postfix(loss_g=loss_g.item()      if hasattr(loss_g, "item") else loss_g,
+                                         latent=loss_latent.item() if hasattr(loss_latent, "item") else loss_latent,
+                                         per_loss=per_loss.item()  if hasattr(loss_g, "item") else per_loss,
+                                         rec_loss=rec_loss.item()  if hasattr(rec_loss, "item") else rec_loss,
+                                         kld_loss=kld_loss.item()  if hasattr(kld_loss, "item") else kld_loss,
+                                         gen_loss=gen_loss.item()  if hasattr(gen_loss, "item") else gen_loss)
 
             
             optimizer_g.zero_grad(set_to_none=True)
@@ -742,8 +807,6 @@ if __name__ == '__main__':
             
 
             del z_mu, z_sigma, loss_g
-  
-
 
             # ⚠️ This is a workaround, but should be improved
             if use_adv:
@@ -768,7 +831,6 @@ if __name__ == '__main__':
                     discriminator_loss = (d_loss_fake) * 0.5
                     loss_d1 = discriminator_loss
 
-                # optimizer_d.zero_grad()
                 accelerator.backward(loss_d1)
                 optimizer_d.step()
                 optimizer_d.zero_grad()
@@ -778,44 +840,36 @@ if __name__ == '__main__':
                 torch.cuda.empty_cache()
          
 
+        if accelerator.is_main_process:
 
+            _image_save_root = f"{image_save_root}/epoch_{epoch}"
+            os.makedirs(_image_save_root, exist_ok=True)
 
-        _image_save_root = f"{image_save_root}/epoch_{epoch}"
-        os.makedirs(_image_save_root, exist_ok=True)
+            autoencoder.eval()
+            validate_model(autoencoder, test_loader, DEVICE,
+                        image_save_root=_image_save_root, max_batches=6,
+                        step_name="Epoch_{}".format(epoch), image_key=image_key)
 
-        autoencoder.eval()
-        validate_model(autoencoder, test_loader, DEVICE,
-                       image_save_root=_image_save_root, max_batches=6,
-                       step_name="Epoch_{}".format(epoch), image_key=image_key)
-
-        
-        # 保存模型
-        if (epoch + 1) % save_epoch == 0 and accelerator.is_main_process:
-            torch.save(discriminator.state_dict(), os.path.join(args.output_dir,
-                                                                f'dis-{epoch + 1}-{image_key_str}.pth'))
             
-            torch.save(autoencoder.state_dict(),
-                       os.path.join(args.output_dir, f'ae-{epoch + 1}-{image_key_str}.pth'))
+            # 保存模型
+            if (epoch + 1) % save_epoch == 0 and accelerator.is_main_process:
+                torch.save(discriminator.state_dict(), os.path.join(args.output_dir,
+                                                                    f'dis-{epoch + 1}-{image_key_str}.pth'))
+                
+                torch.save(autoencoder.state_dict(),
+                        os.path.join(args.output_dir, f'ae-{epoch + 1}-{image_key_str}.pth'))
 
-            print("Saving models to: ",
-                  os.path.join(args.output_dir, f'ae-{epoch + 1}-{image_key_str}.pth'))
+                print("Saving models to: ",
+                    os.path.join(args.output_dir, f'ae-{epoch + 1}-{image_key_str}.pth'))
 
-            try:
-                os.remove(os.path.join(args.output_dir, f'dis-{epoch + 1 - 3}-{image_key_str}.pth'))
-                os.remove(os.path.join(args.output_dir, f'ae-{epoch + 1 - 3}-{image_key_str}.pth'))
-            except:
-                pass
+                try:
+                    os.remove(os.path.join(args.output_dir, f'dis-{epoch + 1 - 3}-{image_key_str}.pth'))
+                    os.remove(os.path.join(args.output_dir, f'ae-{epoch + 1 - 3}-{image_key_str}.pth'))
+                except:
+                    pass
 
-        if epoch + 1 == warmup_epochs:
-            print("🔓 Unfreezing full model...")
-            for p in autoencoder.parameters():
-                p.requires_grad = True
-            optimizer_g = torch.optim.AdamW(
-                autoencoder.parameters(), lr=args.lr
-            )
-            optimizer_g = accelerator.prepare(optimizer_g)
 
-        # accelerator.wait_for_everyone() 
+        accelerator.wait_for_everyone() 
         gc.collect()
         torch.cuda.empty_cache()
 

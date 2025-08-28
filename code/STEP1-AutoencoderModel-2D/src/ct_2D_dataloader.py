@@ -40,7 +40,7 @@ class PairedCTDataset(Dataset):
 
         df["Splits"] = df["Splits"].fillna("").str.lower()
 
-        if split is not None:
+        if split is not None and split != "test_all" :
             df = df[df["Splits"] == split.lower()]
 
         self.df = df.reset_index(drop=True)
@@ -87,7 +87,7 @@ class PairedCTDataset(Dataset):
         ctc = TF.to_tensor(ctc_img)
 
         # x = torch.cat([ct, ctc], dim=0)   # [2,H,W]
-
+    
         meta = {
             "Dataset": it["Dataset"],
             "Subject": it["Subject"],

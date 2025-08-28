@@ -82,7 +82,7 @@ def get_ct_dataloader(args,
             clip=True,
         ),
 
-        ScaleIntensityD(minv=0, maxv=1, keys=image_keys),  # Normalize all but mask
+        
 
         crop_transform,
         ResizeWithPadOrCropd(
@@ -92,6 +92,10 @@ def get_ct_dataloader(args,
             mode="constant",
             value=0  
         ),
+
+        ScaleIntensityD(minv=0, maxv=1, keys=image_keys),  # Normalize all but mask
+
+        
         ToTensord(keys=key_to_load),
     ]
 
@@ -103,10 +107,10 @@ def get_ct_dataloader(args,
         transforms.extend( [
             trans.RandFlipD(prob=0.5, spatial_axis=0, keys=image_keys),
             trans.RandFlipD(prob=0.5, spatial_axis=1, keys=image_keys),
-            trans.RandFlipD(prob=0.5, spatial_axis=2, keys=image_keys),
+            # trans.RandFlipD(prob=0.5, spatial_axis=2, keys=image_keys),
             
-            trans.RandGaussianNoised(keys=image_keys, prob=0.2, mean=0.0, std=0.01),
-            trans.RandAdjustContrastd(keys=image_keys, prob=0.3, gamma=(0.7, 1.5)),
+            # trans.RandGaussianNoised(keys=image_keys, prob=0.2, mean=0.0, std=0.01),
+            # trans.RandAdjustContrastd(keys=image_keys, prob=0.3, gamma=(0.7, 1.5)),
             
 
         ])

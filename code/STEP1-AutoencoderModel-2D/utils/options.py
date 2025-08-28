@@ -43,6 +43,7 @@ parser.add_argument('--resume', default="", type=str, help="Path to resume train
 
 # ---------------- Diffusion ----------------
 parser.add_argument('--num_train_timesteps', default=1000, type=int)
+parser.add_argument("--use_broken", action="store_true")
 parser.add_argument("--use_vig", action="store_true")
 parser.add_argument("--use_seg", action="store_true")
 parser.add_argument("--use_t", action="store_true")
