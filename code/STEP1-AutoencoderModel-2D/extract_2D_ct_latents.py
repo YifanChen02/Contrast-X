@@ -213,17 +213,11 @@ if __name__ == '__main__':
             z_mu    = z_dist.mean
 
             mri_latent = z_mu.cpu().numpy() 
-
-
-            # print("mri_latent = ", mri_latent.shape)   # (16, 16, 128, 128)
-            # print("patient_id = ", patient_id[0] )     # 
-            # /date/hao/PairedContrast/CT/low_256x256_2Dimension/Stomach_Colon_Liver_Pancreas_CT_train_val_test/train/HCC_023_1999-12-24_CT/slice_033/CT.jpg
-
         
 
             # 保存潜在表示, in Batch
             for i, latent in enumerate(mri_latent):
-                img_path = Path(patient_id[i])  # e.g. /.../Stomach_.../train/HCC_023_1999-12-24_CT/slice_033/CT.jpg
+                img_path = Path(patient_id[i])  
 
                 # ---- get "patient_path" you asked for ----
                 rel_dir = img_path.relative_to(DATA_ROOT).parent
@@ -235,8 +229,8 @@ if __name__ == '__main__':
 
                 destpath = out_dir / 'CT_CTC.npz'
                 np.savez_compressed(destpath, data=latent)
-                # print("destpath = ", destpath)
 
+                print("destpath:", destpath)
 
 
             # ct           = batch['CT'].to(DEVICE)

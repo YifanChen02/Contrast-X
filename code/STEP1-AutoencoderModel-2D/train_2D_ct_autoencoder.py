@@ -481,7 +481,6 @@ PY
 
 if __name__ == '__main__':
 
-
     image_key = args.input_modality
 
     
@@ -554,11 +553,11 @@ if __name__ == '__main__':
         print("Resuming from checkpoint:", gen_path)
 
     use_mask_loss     = False
-    use_adv           = True
+    use_adv           = True  #not args.use_broken
     use_kl_loss       = True
 
     adv_weight        = 0.025
-    perceptual_weight = 0.1 # 0.01  
+    perceptual_weight = 0.1 # if  args.use_broken else 0.0  # 0.1  
     kl_weight         = 1e-7  # 1e-7
 
     def charbonnier(x, y, eps=1e-3):
@@ -656,7 +655,7 @@ if __name__ == '__main__':
             if args.DEBUG and step >= 5:
                 break
 
-            if step > 100:  # 390
+            if step > 200:  # 390
                 break
 
             ct    = batch['CT'].to(DEVICE)
@@ -675,12 +674,14 @@ if __name__ == '__main__':
                 input_ct_ctc     = torch.cat([ct, ctc, one_ctc, one_ctc], dim=1)
                 if np.random.rand() < 0.5:
                     input_ct         = torch.cat([ct, zero_ctc, one_ctc, zero_ctc], dim=1)
+                    input_images     = torch.cat([input_ct, input_ct_ctc], dim=0)         # This is Input
                 else:
-                    input_ct         = torch.cat([zero_ctc, ctc, zero_ctc, one_ctc], dim=1)
+                    input_ctc        = torch.cat([zero_ctc, ctc, zero_ctc, one_ctc], dim=1)
+                    input_images     = torch.cat([input_ctc, input_ct_ctc], dim=0)         # This is Input
 
-                input_images     = torch.cat([input_ct, input_ct_ctc], dim=0)         # This is Input
+               
                 images           = torch.cat([torch.cat([ct, ctc], dim=1), 
-                                            torch.cat([ct, ctc], dim=1)], dim=0)    # This is Target
+                                              torch.cat([ct, ctc], dim=1)], dim=0)    # This is Target
 
             else:
                 input_images     = torch.cat([ct, ctc, one_ctc, one_ctc], dim=1)
@@ -709,7 +710,7 @@ if __name__ == '__main__':
                 dec_out = autoencoder.decode(z)              # DecoderOutput
                 reconstruction = dec_out.sample
 
-
+            with accelerator.autocast():
                 if use_adv:
                     logits_fake = discriminator(reconstruction.contiguous())[-1]
                     gen_loss = adv_weight * adv_loss_fn(logits_fake, target_is_real=True, for_discriminator=False)
@@ -717,94 +718,127 @@ if __name__ == '__main__':
                     gen_loss = torch.tensor(0).to(reconstruction.device)
 
 
-                if not use_mask_loss:
-                    rec_loss = l1_loss_fn(reconstruction, images)   # * 5
+            if not use_mask_loss:
+                rec_loss = l1_loss_fn(reconstruction, images)   # * 5
 
-                else:
-                    mask = mask.expand_as(images)
-                    rec_loss = torch.abs(reconstruction * mask - images * mask).sum() / torch.sum(mask)
+            else:
+                mask = mask.expand_as(images)
+                rec_loss = torch.abs(reconstruction * mask - images * mask).sum() / torch.sum(mask)
 
-                kld_loss = kl_weight * kl_loss_fn(z_mu, z_sigma)
+            kld_loss = kl_weight * kl_loss_fn(z_mu, z_sigma)
+        
+            B, C, H, W = reconstruction.shape
+
+
+            # --------------- Perceptural Loss ---------------
+            # Split into CT and CTC
+            recon_ct,  recon_ctc  = reconstruction[:,0:1], reconstruction[:,1:2]  # [B,1,H,W]
+            image_ct,  image_ctc  = images[:,0:1],         images[:,1:2]
+
+            # Duplicate each channel 3× → [B,3,H,W]
+            recon_ct_3  = recon_ct.repeat(1,3,1,1)
+            recon_ctc_3 = recon_ctc.repeat(1,3,1,1)
+            image_ct_3  = image_ct.repeat(1,3,1,1)
+            image_ctc_3 = image_ctc.repeat(1,3,1,1)
+
+            # Stack along batch dim → [B*2, 3, H, W]
+            reconstruction_3ch = torch.cat([recon_ct_3,  recon_ctc_3],  dim=0)
+            images_3ch         = torch.cat([image_ct_3,  image_ctc_3],  dim=0)
+
+            per_loss = torch.tensor(0).to(reconstruction.device)
+
+            # Perceptual loss
+            per_loss = perceptual_weight * perc_loss_fn(
+                reconstruction_3ch.float(),
+                images_3ch.float().detach()
+            )
+
+            # Latent Alignment, wrap kl in FP32
+            z_mu_ct, z_mu_ctc   = torch.chunk(z_dist.mean, 2, dim=0)
+            z_std_ct, z_std_ctc = torch.chunk(z_dist.std, 2, dim=0)
             
-                B, C, H, W = reconstruction.shape
 
+            def kl_gaussians(mu1, std1, mu2, std2, weight=1e-4, eps=1e-6):
+                """
+                KL divergence KL(q1||q2) between two diagonal Gaussians.
+                Uses log-variance for stability.
+                mu1, std1, mu2, std2: (B, D, ...)
+                """
+                # use log-variance to avoid squaring large/small numbers
+                logvar1 = (std1.clamp(min=eps)).log() * 2
+                logvar2 = (std2.clamp(min=eps)).log() * 2
 
-                # --------------- Perceptural Loss ---------------
-                # Split into CT and CTC
-                recon_ct,  recon_ctc  = reconstruction[:,0:1], reconstruction[:,1:2]  # [B,1,H,W]
-                image_ct,  image_ctc  = images[:,0:1],         images[:,1:2]
+                var1 = logvar1.exp()
+                var2 = logvar2.exp()
 
-                # Duplicate each channel 3× → [B,3,H,W]
-                recon_ct_3  = recon_ct.repeat(1,3,1,1)
-                recon_ctc_3 = recon_ctc.repeat(1,3,1,1)
-                image_ct_3  = image_ct.repeat(1,3,1,1)
-                image_ctc_3 = image_ctc.repeat(1,3,1,1)
-
-                # Stack along batch dim → [B*2, 3, H, W]
-                reconstruction_3ch = torch.cat([recon_ct_3,  recon_ctc_3],  dim=0)
-                images_3ch         = torch.cat([image_ct_3,  image_ctc_3],  dim=0)
-
-                per_loss = torch.tensor(0).to(reconstruction.device)
-
-                # Perceptual loss
-                per_loss = perceptual_weight * perc_loss_fn(
-                    reconstruction_3ch.float(),
-                    images_3ch.float().detach()
+                # KL(q1||q2) closed form
+                weights = 1e-2
+                kl = weight * (
+                    (var1 / var2)
+                    + (mu2 - mu1).pow(2) / var2
+                    - 1
+                    + (logvar2 - logvar1)
                 )
 
-                # Latent Alignment
-                z_mu_ct, z_mu_ctc   = torch.chunk(z_dist.mean, 2, dim=0)
-                z_std_ct, z_std_ctc = torch.chunk(z_dist.std, 2, dim=0)
-                
+                # flatten across latent dims, then sum per-sample
+                kl = kl.flatten(1).sum(1)
+                return weight * kl.mean()
 
-                def kl_gaussians(mu1, std1, mu2, std2, weight=1e-4, eps=1e-6):
-                    """
-                    KL divergence KL(q1||q2) between two diagonal Gaussians.
-                    Uses log-variance for stability.
-                    mu1, std1, mu2, std2: (B, D, ...)
-                    """
-                    # use log-variance to avoid squaring large/small numbers
-                    logvar1 = (std1.clamp(min=eps)).log() * 2
-                    logvar2 = (std2.clamp(min=eps)).log() * 2
-
-                    var1 = logvar1.exp()
-                    var2 = logvar2.exp()
-
-                    # KL(q1||q2) closed form
-                    weights = 1e-2
-                    kl = weight * (
-                        (var1 / var2)
-                        + (mu2 - mu1).pow(2) / var2
-                        - 1
-                        + (logvar2 - logvar1)
-                    )
-
-                    # flatten across latent dims, then sum per-sample
-                    kl = kl.flatten(1).sum(1)
-                    return weight * kl.mean()
-
-                if use_broken:
-                    loss_latent = kl_gaussians(z_mu_ct, z_std_ct, z_mu_ctc.detach(), z_std_ctc.detach())
-                else:
-                    loss_latent = torch.tensor(0)
+            if use_broken:
+                loss_latent = kl_gaussians(z_mu_ct.float(), z_std_ct.float(), z_mu_ctc.detach().float(), z_std_ctc.detach().float())
+            else:
+                loss_latent = torch.tensor(0)
 
 
-                loss_g = rec_loss + kld_loss + gen_loss + per_loss + loss_latent
+            loss_g = rec_loss + kld_loss + gen_loss + per_loss + loss_latent
 
-                progress_bar.set_postfix(loss_g=loss_g.item()      if hasattr(loss_g, "item") else loss_g,
-                                         latent=loss_latent.item() if hasattr(loss_latent, "item") else loss_latent,
-                                         per_loss=per_loss.item()  if hasattr(loss_g, "item") else per_loss,
-                                         rec_loss=rec_loss.item()  if hasattr(rec_loss, "item") else rec_loss,
-                                         kld_loss=kld_loss.item()  if hasattr(kld_loss, "item") else kld_loss,
-                                         gen_loss=gen_loss.item()  if hasattr(gen_loss, "item") else gen_loss)
+            progress_bar.set_postfix(loss_g=loss_g.item()      if hasattr(loss_g, "item") else loss_g,
+                                        latent=loss_latent.item() if hasattr(loss_latent, "item") else loss_latent,
+                                        per_loss=per_loss.item()  if hasattr(loss_g, "item") else per_loss,
+                                        rec_loss=rec_loss.item()  if hasattr(rec_loss, "item") else rec_loss,
+                                        kld_loss=kld_loss.item()  if hasattr(kld_loss, "item") else kld_loss,
+                                        gen_loss=gen_loss.item()  if hasattr(gen_loss, "item") else gen_loss)
 
             
             optimizer_g.zero_grad(set_to_none=True)
-            accelerator.backward(loss_g)
+
+            # Check for NaN in the loss
+            try:
+                accelerator.backward(loss_g)
+
+            except Exception as e:
+                print(f"Error during backward: {e}")
+                optimizer_g.zero_grad(set_to_none=True)
+                accelerator.wait_for_everyone() 
+
+                gen_path = os.path.join(args.output_dir, f'ae-{epoch}-{image_key_str}.pth')
+
+                if os.path.exists(gen_path):
+                    autoencoder.load_state_dict(remove_module_prefix(torch.load(gen_path)))
+                else:
+                    print(f"Autoencoder checkpoint not found: {gen_path}. Starting from scratch.")
+                print("Resuming from checkpoint:", gen_path)
+
+                optimizer_g = torch.optim.AdamW(autoencoder.parameters(), lr=args.lr)
+                scheduler_g = torch.optim.lr_scheduler.CyclicLR(
+                    optimizer_g,
+                    base_lr=args.lr * 0.1,
+                    max_lr=args.lr,
+                    step_size_up=5000,
+                    mode="triangular2",
+                    cycle_momentum=False
+                )   
+                autoencoder, optimizer_g, autoencoder.decode,  autoencoder.encode = accelerator.prepare(
+                    autoencoder, optimizer_g, autoencoder.decode,  autoencoder.encode
+                )
+
+                continue
    
             optimizer_g.step()
             scheduler_g.step() 
             
+            torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
+
 
             del z_mu, z_sigma, loss_g
 
@@ -862,11 +896,11 @@ if __name__ == '__main__':
                 print("Saving models to: ",
                     os.path.join(args.output_dir, f'ae-{epoch + 1}-{image_key_str}.pth'))
 
-                try:
-                    os.remove(os.path.join(args.output_dir, f'dis-{epoch + 1 - 3}-{image_key_str}.pth'))
-                    os.remove(os.path.join(args.output_dir, f'ae-{epoch + 1 - 3}-{image_key_str}.pth'))
-                except:
-                    pass
+                # try:
+                #     os.remove(os.path.join(args.output_dir, f'dis-{epoch + 1 - 3}-{image_key_str}.pth'))
+                #     os.remove(os.path.join(args.output_dir, f'ae-{epoch + 1 - 3}-{image_key_str}.pth'))
+                # except:
+                #     pass
 
 
         accelerator.wait_for_everyone() 

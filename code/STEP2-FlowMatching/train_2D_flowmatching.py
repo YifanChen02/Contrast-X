@@ -2,7 +2,6 @@ import os, gc
 import torch
 import torch.nn.functional as F
 import pandas as pd
-from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
 
 from monai.utils import set_determinism
@@ -27,7 +26,7 @@ from collections import OrderedDict
 from copy import deepcopy
 
 from src import diffusion
-from src.brats_dataloader import get_brats_dataloader
+from src.ct_2D_latent_dataloader import create_paired_dataloader
 from accelerate import DistributedDataParallelKwargs
 
 from src import networks
@@ -50,8 +49,6 @@ DEVICE = accelerator.device
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 set_determinism(0)
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 
 
 os.makedirs(args.cache_dir,  exist_ok=True)
@@ -64,23 +61,6 @@ from monai.networks.schedulers.ddpm import DDPMPredictionType
 from monai.networks.schedulers.ddim import DDIMPredictionType
 
 
-
-spatial_size = (96, 96, 96)
-
-
-def prepare_latent(latents, mask, ratio=4):
-    size = [s // ratio for s in spatial_size]
-
-    # BG mask
-    shrink_mask = F.interpolate(
-        (mask <= 0).float(),
-        size=size,
-        mode='trilinear',
-        align_corners=False
-    )
-
-    return latents * shrink_mask, shrink_mask
-      
 
 @torch.no_grad()
 def sample_using_diffusion(
@@ -136,17 +116,17 @@ def sample_using_diffusion(
 
     # decode the latent
     z = z / scale_factor
-    z = utils.to_vae_latent_trick(z.cpu(), unpadded_z_shape=(z.shape[0], 4, *[s // 4 for s in spatial_size]))
-    x = autoencoder.decode(z.to(device)).cpu()  #.sample.cpu().squeeze(1)
+    # z = utils.to_vae_latent_trick(z.cpu(), unpadded_z_shape=(z.shape[0], 4, *[s // 2 for s in spatial_size]))
+    x = autoencoder.decode(z.to(device)).sample.cpu()  #.sample.cpu().squeeze(1)
 
     return x
 
 
 
 mask_key       = "mask"
-latent_key     = "latent"
-file_key       = "filename"
-broken_latent_key = "broken-latent"
+latent_key     = "CTC"
+file_key       = "CT_path"  # CTC_path
+broken_latent_key = "CT"
 
 
 def remove_module_prefix(state_dict):
@@ -232,6 +212,114 @@ def save_grid_image_by_plane(image_np, recon_broken, recon_np, save_root, b, epo
         plt.savefig(save_path, dpi=150)
         plt.close()
 
+import imageio
+
+def save_(image, save_root, epoch=0, modality_names=None, fname="stacked.png"):
+    """
+    Save a stacked numpy image as PNG.
+
+    Args:
+        image (np.ndarray): 2D or 3D array.
+            If 2D: (H, W)
+            If 3D: (H, W, C)
+        save_root (str): directory to save file
+        epoch (int): epoch number for filename
+        modality_names (list[str]): optional names for modalities
+        fname (str): custom filename
+    """
+    os.makedirs(save_root, exist_ok=True)
+    out_path = os.path.join(save_root, f"epoch{epoch:03d}_{fname}")
+
+    # normalize if needed
+    if image.dtype != np.uint8:
+        img_min, img_max = image.min(), image.max()
+        if img_max > img_min:  # avoid div by zero
+            image = (255 * (image - img_min) / (img_max - img_min)).astype(np.uint8)
+        else:
+            image = (image * 255).astype(np.uint8)
+
+    # save
+    imageio.imwrite(out_path, image)
+    print(f"✅ Validation Saved: {out_path}")
+
+
+def stack_and_save(image_np, recon_broken, recon_np, save_root, epoch, modality_names):
+    """
+    Stack [original, broken, recon] images for visualization.
+
+    Args:
+        image_np, recon_broken, recon_np: np.ndarray (B, C, H, W)
+        save_root (str): output directory
+        epoch (int): current epoch
+        modality_names (list[str]): names for modalities
+    """
+    image_stacked = []
+    for b in range(min(image_np.shape[0], 3)):  # only save up to 3 samples
+        image_c = []
+        for c in range(image_np.shape[1]):
+            # horizontally concat triplet
+            image_c.append(image_np[b, c])
+            image_c.append(recon_broken[b, c])
+            image_c.append(recon_np[b, c])
+
+        # stack modalities vertically → (C*H, 3*W)
+        image_c = np.concatenate(image_c, axis=-1)
+        image_stacked.append(image_c)
+
+    # stack batch samples vertically → (B*C*H, 3*W)
+    image_stacked = np.concatenate(image_stacked, axis=0)
+
+    # save
+    save_(image_stacked, save_root, epoch=epoch, fname="stacked.png",
+        modality_names=modality_names[:image_np.shape[1]])
+
+
+use_standard_norm = True 
+
+import torch
+
+def standard_normalize(x, mean=None, std=None, eps=1e-8):
+    """
+    Standard-normalize a batch of images/volumes.
+    
+    Args:
+        x   : torch.Tensor of shape (B, C, H, W) or (B, C, D, H, W)
+        mean: torch.Tensor or None. If None, compute per-batch mean.
+        std : torch.Tensor or None. If None, compute per-batch std.
+        eps : small constant to avoid division by zero.
+    
+    Returns:
+        x_norm: normalized tensor
+        mean  : mean used for normalization
+        std   : std used for normalization
+    """
+    if mean is None:
+        mean = x.mean(dim=tuple(range(1, x.ndim)), keepdim=True)
+    if std is None:
+        std = x.std(dim=tuple(range(1, x.ndim)), keepdim=True) + eps
+
+    x_norm = (x - mean) / std
+
+    x_norm = torch.clamp(x_norm, -6, 6)
+
+    return x_norm, mean, std
+
+
+def denormalize(x_norm, mean, std):
+    """
+    Invert standard normalization.
+    
+    Args:
+        x_norm: normalized tensor
+        mean  : mean used in normalization
+        std   : std used in normalization
+    
+    Returns:
+        x: denormalized tensor
+    """
+    return x_norm * std + mean
+
+
 
 def images_to_tensorboard(
         batch,
@@ -246,7 +334,14 @@ def images_to_tensorboard(
     """
     Visualize the generation on tensorboard
     """
+    
 
+    ct_img = batch["CT_img"]
+    ctc_img = batch["CTC_img"]
+
+    if use_standard_norm:
+        ct_img, ct_mean, ct_std    = standard_normalize(ct_img)
+        ctc_img, ctc_mean, ctc_std = standard_normalize(ctc_img)
 
     x0 = batch[latent_key].to(DEVICE).clone() * scale_factor
     x1 = batch[broken_latent_key].to(DEVICE).clone() * scale_factor
@@ -266,8 +361,8 @@ def images_to_tensorboard(
             scale_factor=scale_factor
         )
 
-        recon_origin = ae.decode(x0 / scale_factor).cpu().numpy()  # [B, 1, H, W]
-        recon_broken = ae.decode(x1 / scale_factor).cpu().numpy()  # [B, 1, H, W]
+        recon_origin = ae.decode(x0 / scale_factor).sample.cpu().numpy()  # [B, 1, H, W]
+        recon_broken = ae.decode(x1 / scale_factor).sample.cpu().numpy()  # [B, 1, H, W]
 
 
     image_np     = recon_origin  #.cpu().numpy()  # [B, 1, H, W]
@@ -276,89 +371,124 @@ def images_to_tensorboard(
     save_root = "./fm_samples"
     os.makedirs(save_root, exist_ok=True)
 
-    # for b in range(image_np.shape[0]):
    
     modality_names = [m.upper() for m in modality_names]
 
+    if use_standard_norm:
+        ct_mean = ct_mean.cpu().numpy()
+        ct_std  = ct_std.cpu().numpy()
+        recon_np = denormalize(recon_np, ct_mean, ct_std) #.cpu().numpy()
+        recon_broken = denormalize(recon_broken, ct_mean, ct_std)#.cpu().numpy()
+        image_np = denormalize(image_np, ct_mean, ct_std)#.cpu().numpy
 
-    for b in range(min(image_np.shape[0], 3)):
-        # print("image_np[b] =", image_np[b].shape, recon_broken[b].shape, recon_np[b].shape, context_np[b].shape)
-        save_grid_image_by_plane(image_np, recon_broken, recon_np, 
-                                 save_root, b, epoch,
-                                 modality_names=modality_names[:image_np[b].shape[0]])
+    # print("image_np[b] =", image_np[b].shape, recon_broken[b].shape, recon_np[b].shape, context_np[b].shape)
+    stack_and_save(image_np, recon_broken, recon_np, save_root, epoch, modality_names)
+  
+    from skimage.metrics import peak_signal_noise_ratio as psnr
+    from skimage.metrics import structural_similarity as ssim
 
+   
+    def evaluate_images_modalities(image_np, recon_broken, recon_np, modality_names=None, idx=0):
+        """
+        Compute PSNR and SSIM per modality:
+            - recon_np (Fake) vs image_np (Target)
+            - recon_broken (Input) vs image_np (Target)
 
+        Args:
+            image_np: np.ndarray (B,C,H,W)
+            recon_broken: np.ndarray (B,C,H,W)
+            recon_np: np.ndarray (B,C,H,W)
+            modality_names: list of modality names (len=C)
+            idx: validation index
+        """
+        B, C, H, W = image_np.shape
+        if modality_names is None:
+            modality_names = [f"Modality-{c}" for c in range(C)]
 
-class CustomPerceptualLoss(nn.Module):
-    def __init__(self, in_channels=3,):
-        super().__init__()
+        # Storage
+        psnr_after, ssim_after = [[] for _ in range(C)], [[] for _ in range(C)]
+        psnr_before, ssim_before = [[] for _ in range(C)], [[] for _ in range(C)]
 
-        from monai.networks.nets import resnet10, resnet18, resnet34
-        import torch.nn as nn
+        for b in range(B):
+            for c in range(C):
+                target    = image_np[b, c]
+                input_img = recon_broken[b, c]
+                fake_img  = recon_np[b, c]
 
-        # Load pretrained DenseNet121 on MedNIST (6-class)
-        feature_model = resnet18(spatial_dims=3, n_input_channels=1, 
-                                    pretrained=True, feed_forward=False,       
-                                    shortcut_type='A',
-                                    bias_downsample=True)
+                rng = target.max() - target.min() if target.max() > target.min() else 1.0
 
-        # Adjust the model in_channels if necessary
-        if in_channels != 1:
-            # Step 2: Modify the first conv layer to accept more channels
-            old_conv = feature_model.conv1  #stem[0]
-            new_conv = nn.Conv3d(
-                in_channels=in_channels,
-                out_channels=old_conv.out_channels,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=old_conv.bias is not None
-            )
+                # Fake vs Target
+                psnr_after[c].append(psnr(target, fake_img, data_range=rng))
+                ssim_after[c].append(ssim(target, fake_img, data_range=rng))
 
-            # Step 3: Copy pretrained weights
-            with torch.no_grad():
-                if in_channels == 1:
-                    new_conv.weight.copy_(old_conv.weight)
-                elif in_channels < 4:
-                    # Repeat weights from the 1-channel model
-                    new_conv.weight.copy_(old_conv.weight.repeat(1, in_channels, 1, 1, 1) / in_channels)
-                else:
-                    # Use mean across input dim if in_channels is large
-                    new_conv.weight.copy_(
-                        old_conv.weight.mean(dim=1, keepdim=True).repeat(1, in_channels, 1, 1, 1)
-                    )
+                # Input vs Target
+                psnr_before[c].append(psnr(target, input_img, data_range=rng))
+                ssim_before[c].append(ssim(target, input_img, data_range=rng))
 
-            # Replace the conv layer
-            feature_model.conv1 = new_conv
-
-
-
-        feature_model.eval()
-        for p in feature_model.parameters():
-            p.requires_grad = False
-
-
-        # print("feature_model = ", feature_model)
-
-        self.feature_extractor = nn.Sequential(
-            feature_model.conv1,
-            feature_model.bn1,
-            feature_model.act,
-            feature_model.maxpool,
-            feature_model.layer1,
-            feature_model.layer2
-        )
-
-        self.criterion = nn.L1Loss()
-
-    def forward(self, input, target):
-        # Get features from both inputs
-        input_feats  = self.feature_extractor(input).detach()
-        target_feats = self.feature_extractor(target)
-        return self.criterion(input_feats, target_feats)
+        # Print nicely
+        print(f"\n[Validation Summary over Epochs {idx}]")
+        print("----------------------------------------------------------------------------------------------------")
+        print(f"{'Modality':15} | {'Fake→Target PSNR':18} | {'Input→Target PSNR':18} | {'Fake→Target SSIM':18} |  {'Input→Target SSIM':18}")
+        print("----------------------------------------------------------------------------------------------------")
+        for c, name in enumerate(modality_names):
+            print(f"{name:15} | {np.mean(psnr_after[c]):.3f}{'':12} | {np.mean(psnr_before[c]):.3f}{'':12} | {np.mean(ssim_after[c]):.3f}{'':12} |  {np.mean(ssim_before[c]):.3f}{'':12}")
+        print("----------------------------------------------------------------------------------------------------")
 
 
 
+    evaluate_images_modalities(image_np, recon_broken, recon_np, modality_names=modality_names, idx=epoch)
+
+
+
+def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
+    from huggingface_hub import snapshot_download
+    from diffusers import AutoencoderKL
+    
+    from diffusers.models import AutoencoderKL
+
+    block_out_channels=(256, 512)
+    layers_per_block = 3
+
+    n_blocks = len(block_out_channels)
+
+    vae = AutoencoderKL(
+        in_channels=in_channels, out_channels=out_channels, latent_channels=latent_channels,
+        block_out_channels=block_out_channels, 
+        down_block_types=("DownEncoderBlock2D",) * n_blocks,
+        up_block_types=("UpDecoderBlock2D",) * n_blocks,
+        layers_per_block=layers_per_block,   # 3
+        norm_num_groups=32
+    )
+
+
+
+    return vae
+
+
+def charbonnier_smooth_l1_loss(pred, target, beta=0.05, eps=1e-6, reduction='mean'):
+    """
+    Charbonnier-SmoothL1 hybrid loss:
+    sqrt( (SmoothL1(pred, target))^2 + eps^2 )
+
+    Args:
+        pred (Tensor): predictions
+        target (Tensor): ground truth
+        beta (float): SmoothL1 transition point
+        eps (float): stability term for Charbonnier
+        reduction (str): 'mean', 'sum', or 'none'
+    """
+    # elementwise SmoothL1 (no reduction yet)
+    diff = F.smooth_l1_loss(pred, target, beta=beta, reduction='none')
+    # wrap with Charbonnier
+    loss = torch.sqrt(diff * diff + eps * eps)
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
+                        
 if __name__ == '__main__':
     image_key = args.input_modality
 
@@ -367,28 +497,34 @@ if __name__ == '__main__':
     else:
         image_key_str = str(image_key)
 
-
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ---------------- Define Dataloader ----------------
     num_train_timesteps = 1000
-    
-    dimension = 3
-    spatial_size = (96, 96, 96)  #(128, 128, 128)
-    # spatial_size = (64, 64, 64)  # (128, 128, 128)
-    key_to_load  = ["mask", "density"] #["mask", "density"]
-    
-    in_channels  = len(image_key)   
+    # (16, 128, 128) , latent
+
+    dimension = 2
+    key_to_load  = []         
     key_to_load.extend(image_key)
 
-    train_loader      = get_brats_dataloader(args.data_dir, args.latent_dir, mode="train", batch_size=args.batch_size,
-                                            spatial_size=spatial_size, key_to_load=key_to_load, cache_dir=args.cache_dir)
-    valid_loader      = get_brats_dataloader(args.data_dir, args.latent_dir, mode="test",  batch_size=args.batch_size,
-                                            spatial_size=spatial_size, key_to_load=key_to_load, cache_dir=args.cache_dir)
+
+    data_root    = args.data_dir
+    latent_root  = args.latent_dir  # wherever you want latents
+    spatial_size = [256, 256]  # 512 or 256
+
+    train_loader, train_ds     = create_paired_dataloader(csv_path=args.dataset_csv, 
+                                                          data_root=data_root, out_root=latent_root,
+                                                          split="train", batch_size=args.batch_size, spatial_size=spatial_size)
+    test_loader,  test_ds      = create_paired_dataloader(csv_path=args.dataset_csv, data_root=data_root, out_root=latent_root,
+                                                          split="test",  batch_size=args.batch_size, spatial_size=spatial_size)
 
 
+    in_channels = len(image_key)
     print("Setting up Autoencoder model...")
-    autoencoder = init_autoencoder(in_channels=in_channels)
+    autoencoder   = define_2DAE(in_channels=in_channels * 2, 
+                                out_channels=in_channels,
+                                latent_channels = 16).to(DEVICE).float()
+    
     print("Finish setting up...")
     try:
         weight = torch.load(args.aekl_ckpt)
@@ -402,25 +538,19 @@ if __name__ == '__main__':
     autoencoder.to(DEVICE)
     autoencoder.eval()  # Important for inference
 
-    perceptual_loss_fn = CustomPerceptualLoss(in_channels=4)  # in_channels=4
 
-
-    diffusion = networks.init_latent_diffusion(args, use_image=False).to(DEVICE)
-
-
-    scheduler = DDPMScheduler(
-        num_train_timesteps=num_train_timesteps,
-        prediction_type = DDPMPredictionType.SAMPLE,
-        schedule='scaled_linear_beta',
-        beta_start=0.0015,
-        beta_end=0.0205
-    )
-
-    inferer   = DiffusionInferer(scheduler=scheduler)
+    diffusion = networks.init_latent_diffusion(args, in_channels=16, use_image=False, spatial_dims=dimension).to(DEVICE)
     optimizer = torch.optim.AdamW(diffusion.parameters(), lr=args.lr, weight_decay=1e-6)  # AdamW
 
-    # with torch.no_grad(), accelerator.autocast():
-    #     z = data_loader.dataset[0:5][latent_key]
+    scheduler_g = torch.optim.lr_scheduler.CyclicLR(
+        optimizer,
+        base_lr=args.lr * 0.1,      # minimum LR
+        max_lr =args.lr,             # maximum LR
+        step_size_up=5000,          # number of steps to go from base_lr → max_lr
+        mode="triangular2",         # triangular2 decays amplitude after each cycle
+        cycle_momentum=False        # must be False for AdamW
+    )
+
     a = train_loader.dataset[0][latent_key]
 
     with torch.no_grad(), accelerator.autocast():
@@ -428,15 +558,14 @@ if __name__ == '__main__':
         z = torch.stack(z_list, dim=0)  # Stack into a single tensor
 
 
-    scale_factor = 1 / torch.std(z)  #  1.3949819803237915
+    scale_factor = 1 / torch.std(z)  
     print(f"Scaling factor set to {scale_factor}")
 
-    autoencoder, optimizer, train_loader, diffusion, perceptual_loss_fn = accelerator.prepare(
-        autoencoder, optimizer, train_loader, diffusion, perceptual_loss_fn, 
-        # ddp_kwargs={"find_unused_parameters": True}
+    autoencoder, optimizer, train_loader, diffusion, scheduler_g = accelerator.prepare(
+        autoencoder, optimizer, train_loader, diffusion, scheduler_g
     )
 
-    writer   = SummaryWriter()
+    # writer   = SummaryWriter()
     global_counter = {'train': 0}  # , 'valid': 0 }
     loaders  = {'train': train_loader}  # , # 'valid': valid_loader }
     datasets = {'train': train_loader.dataset}  # , 'valid': validset }
@@ -464,22 +593,29 @@ if __name__ == '__main__':
                     if mode == 'train': optimizer.zero_grad(set_to_none=True)
 
                     # Use to be  context: context tensor (N, 1, ContextDim).
-                    B = batch[latent_key].shape[0]
-                    t = torch.rand(B, device=DEVICE).long()
+                    B         = batch[latent_key].shape[0]
+                    t         = torch.rand(B, device=DEVICE)
                     x0        = batch[latent_key].to(DEVICE).clone() * scale_factor
                     x1        = batch[broken_latent_key].to(DEVICE).clone() * scale_factor
 
                     # x0 -> x1
-                    xt = compute_xt(x0=x0, x1=x1, t=t)
+                    sigma = 0.01
+                    xt = compute_xt(x0=x0, x1=x1, t=t, sigma_min=sigma)
                     ut = compute_ut(x0=x0, x1=x1, t=t)
                     
-                    # vt = self.forward(x=xt, t=t, **cond_kwargs)
-         
                     pred = diffusion(x=xt, timesteps=t, context=None)
 
-                    loss = F.mse_loss(pred, ut)  # MSE Loss
+                    
 
-          
+                    # loss = F.mse_loss(pred, ut)  # MSE Loss
+                    loss = charbonnier_smooth_l1_loss(pred, ut)
+
+
+                    # cos_loss = 1 - F.cosine_similarity(pred, ut, dim=1).mean()
+                    # mag_loss = charbonnier_smooth_l1_loss(pred, ut)
+                    # loss = cos_loss + 0.1 * mag_loss
+
+
 
                 if mode == 'train':
                     # Accumulated Loss
@@ -489,6 +625,7 @@ if __name__ == '__main__':
                     if (step + 1) % gradient_accumulation_steps == 0 or (step + 1 == len(loader)):
                         optimizer.step()
                         optimizer.zero_grad()
+                        scheduler_g.step() 
 
 
                 epoch_loss += loss.item()
@@ -503,12 +640,12 @@ if __name__ == '__main__':
 
             # end of epoch
             epoch_loss = epoch_loss / len(loader)
-            writer.add_scalar(f'{mode}/epoch-mse', epoch_loss, epoch)
+            # writer.add_scalar(f'{mode}/epoch-mse', epoch_loss, epoch)
 
             # visualize results
             images_to_tensorboard(
                 batch=batch,
-                writer=writer,
+                writer=None,
                 epoch=epoch,
                 mode=mode,
                 autoencoder=autoencoder,
@@ -516,7 +653,6 @@ if __name__ == '__main__':
                 scale_factor=scale_factor,
                 modality_names=image_key
             )
-
 
 
 

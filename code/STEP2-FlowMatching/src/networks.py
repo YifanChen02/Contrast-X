@@ -204,7 +204,7 @@ def init_patch_discriminator(checkpoints_path: Optional[str] = None, spatial_dim
     return load_if(checkpoints_path, patch_discriminator)
 
 
-def init_latent_diffusion(args: Optional[str] = None, in_channels=4, use_image=True) -> nn.Module:
+def init_latent_diffusion(args: Optional[str] = None, in_channels=4, use_image=True, spatial_dims=3) -> nn.Module:
     """
     Load the UNet from the diffusion model (pretrained if `checkpoints_path` points to previous params).
 
@@ -217,9 +217,9 @@ def init_latent_diffusion(args: Optional[str] = None, in_channels=4, use_image=T
     if use_image:
         from .unet_image_cond import DiffusionModelUNet
     else:
-        from .unet import DiffusionModelUNet
+        from .unet_2d import DiffusionModelUNet
 
-    latent_diffusion = DiffusionModelUNet(spatial_dims=3,
+    latent_diffusion = DiffusionModelUNet(spatial_dims=spatial_dims,
                                           in_channels=in_channels,
                                           out_channels=in_channels,
                                           num_res_blocks=2,

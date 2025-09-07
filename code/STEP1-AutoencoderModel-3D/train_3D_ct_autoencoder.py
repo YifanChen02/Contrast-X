@@ -280,7 +280,7 @@ missing_modality = args.missing_modality
 def define_3D_AE(inchannel=2, latent_channels = 16):
 
     from monai.networks.nets import AutoencoderKL
-    block_out_channels = (128, 256, 512)
+    block_out_channels = (256, 512)  # 128
     n_blocks = len(block_out_channels)
 
     vae = AutoencoderKL(
@@ -288,7 +288,7 @@ def define_3D_AE(inchannel=2, latent_channels = 16):
         in_channels=in_channels,
         out_channels=in_channels,
         channels=block_out_channels,      # corresponds to your block_out_channels
-        num_res_blocks=2,          # corresponds to your layers_per_block
+        num_res_blocks=3,          # corresponds to your layers_per_block
         latent_channels=latent_channels,
         norm_num_groups=32,
         attention_levels=(False,) * n_blocks,  # no attention at either level

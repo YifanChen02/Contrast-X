@@ -25,41 +25,32 @@ CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 -
       --input_modality   CT CTC    --missing_modality   CTC  \
       --output_dir  ${temp}/checkpoint/CT/2D_AE  
 
-      
 
+
+# 42 is the pure ~ 40 , 44 is the mix
 CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 --main_process_port 19250 \
       train_2D_ct_autoencoder.py --gpu $gpu  \
       --dataset_csv $data_files   --task  $task \
-      --batch_size 18  --n_epochs  200    --lr 3e-4 \
-      --cache_dir  ${temp}/cache/CT_all      \
-      --input_modality   CT CTC    --missing_modality   CTC  \
-      --output_dir  ${temp}/checkpoint/CT/2D_AE      --use_broken        --DEBUG      
-
-
-
-
-CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 --main_process_port 19250 \
-      train_2D_ct_autoencoder.py --gpu $gpu  \
-      --dataset_csv $data_files   --task  $task \
-      --batch_size 18  --n_epochs  200    --lr 3e-4 \
-      --cache_dir  ${temp}/cache/CT_all     --resume  27  \
+      --batch_size 6  --n_epochs  200    --lr 1e-5  \
+      --cache_dir  ${temp}/cache/CT_all     --resume  69   \
       --input_modality   CT CTC    --missing_modality   CTC  \
       --output_dir  ${temp}/checkpoint/CT/2D_AE     --use_broken      --DEBUG      
 
 
 
 
-#####  Test 2DAE
-gpu=6
+#####  ------------- Test 2DAE -----------------------
+gpu=5,6,7
 data_files=../data/files/2D_CT_pair.csv
-aekl_ckpt=/date/hao/FM/checkpoint/CT/AE/ae-132-CT-CTC.pth
+aekl_ckpt=/date/hao/FM/checkpoint/CT/2D_AE/ae-58-CT-CTC.pth
 
 data_dir=/date/hao/PairedContrast/CT/low_256x256_2Dimension
-output_dir=/date/hao/FM/latent/CT/2D
+output_dir=/date/hao/FM/latent/CT-CTC/2D
+
 
 CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 --main_process_port 18250 \
       extract_2D_latents.py --gpu $gpu  \
-      --data_dir $data_dir  \
+      --data_dir $data_dir  --batch_size 32   \
       --dataset_csv $data_files   --task  $task \
       --input_modality   CT CTC    --missing_modality   CTC  \
       --aekl_ckpt $aekl_ckpt      --output_dir  $output_dir    --DEBUG    
@@ -109,20 +100,30 @@ CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 -
 
 
 # -------------------- Train Flow Matching -----------------------
-gpu=0,1
+gpu=4,5,6,7
+cd ../STEP2-FlowMatching
+
+task=CT 
+latent_dir=/date/hao/FM/latent/CT-CTC/2D
+data_dir=/date/hao/PairedContrast/CT/low_256x256_2Dimension
+output_dir=/date/hao/FM/latent/CT-CTC/2D
+aekl_ckpt=/date/hao/FM/checkpoint/CT/2D_AE/ae-58-CT-CTC.pth
+data_files=../data/files/2D_CT_pair.csv
+temp=/date/hao/FM
 
 CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 \
-        train_flowmatching.py   \
+        train_2D_flowmatching.py   \
         --batch_size   4  \
-        --gpu  $gpu      --input_modality  t1n   \
+        --dataset_csv $data_files   --task  $task \
+        --gpu  $gpu      --input_modality   CT CTC    \
         --lr    2.5e-5     \
         --n_epochs  500  \
-        --grad_accum_steps 3  \
-        --latent_dir $temp_dir/Tumor/AE/results/brats_latent/t1n  \
-        --cache_dir  $temp_dir/Tumor/AE/results/cache_dm_t1n   \
-        --output_dir $temp_dir/Tumor/AE/results/output \
-        --aekl_ckpt  $temp_dir/Tumor/AE/results/output/ae-50-t1n.pth   \
-        --data_dir   ~/hao/data/brats/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData     --DEBUG
+        --grad_accum_steps 2  \
+        --latent_dir $latent_dir  \
+        --cache_dir ${temp}/cache/CT_all   \
+        --output_dir $output_dir \
+        --aekl_ckpt  $aekl_ckpt   \
+        --data_dir   $data_dir    --DEBUG
 
 
 

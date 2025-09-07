@@ -28,8 +28,11 @@ gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
 
 ut = gray2.astype(np.float32) - gray1.astype(np.float32)
 
+ut = np.abs(ut)
+
+ut_norm = ut
 # Normalize for visualization (0..1)
-ut_norm = (ut - ut.min()) / (ut.max() - ut.min() + 1e-8)
+# ut_norm = (ut - ut.min()) / (ut.max() - ut.min() + 1e-8)
 
 # Save ut as an image
 cmaps = ["seismic", "coolwarm", "bwr", "viridis", "plasma", "inferno",
