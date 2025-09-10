@@ -313,11 +313,11 @@ PY
     
     from diffusers.models import AutoencoderKL
 
-    block_out_channels=(256, 512)
-    layers_per_block = 3
+    # block_out_channels=(256, 512)
+    # layers_per_block = 3
 
-    # block_out_channels=(256, 256, 512) # 128, 256
-    # layers_per_block = 2
+    block_out_channels=(128, 128, 256) # 128, 256
+    layers_per_block = 2
 
     n_blocks = len(block_out_channels)
 
@@ -335,154 +335,13 @@ PY
     return vae
 
 
-    
-
-    from diffusers import AutoencoderKL
-    vae = AutoencoderKL.from_pretrained("/date/hao/models/sd-vae-ft-ema")  # , local_files_only=True)
-    # vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema", force_upcast=True)        # , subfolder=subfolder)
-    # vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-v1-5", force_upcast=True)     # , subfolder="vae")
-
-    # vae.config.latent_channels = 16  
-
-    out_channels = in_channels = inchannel
-
-    # --- Adjust encoder input conv ---
-    if in_channels != vae.config.in_channels:
-        old_conv = vae.encoder.conv_in
-        new_conv = nn.Conv2d(
-            in_channels,
-            old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding
-        )
-
-        with torch.no_grad():
-            if in_channels < vae.config.in_channels:
-                new_conv.weight[:, :in_channels, :, :] = old_conv.weight[:, :in_channels, :, :]
-                if in_channels == 1:  # grayscale
-                    new_conv.weight[:, 0, :, :] = old_conv.weight.mean(dim=1)
-            else:
-                new_conv.weight[:, :3, :, :] = old_conv.weight
-                nn.init.xavier_uniform_(new_conv.weight[:, 3:, :, :])
-            new_conv.bias = nn.Parameter(old_conv.bias.clone())
-
-        vae.encoder.conv_in = new_conv
-        vae.config.in_channels = in_channels
-        print(f"🔧 Updated encoder input conv → {in_channels} channels")
-
-    # --- Adjust decoder output conv ---
-    if out_channels != vae.config.out_channels:
-        old_conv_out = vae.decoder.conv_out
-        new_conv_out = nn.Conv2d(
-            old_conv_out.in_channels,
-            out_channels,
-            kernel_size=old_conv_out.kernel_size,
-            stride=old_conv_out.stride,
-            padding=old_conv_out.padding
-        )
-
-        with torch.no_grad():
-            if out_channels < vae.config.out_channels:
-                new_conv_out.weight[:out_channels, :, :, :] = old_conv_out.weight[:out_channels, :, :, :]
-                if out_channels == 1:
-                    new_conv_out.weight[0, :, :, :] = old_conv_out.weight.mean(dim=0)
-            else:
-                new_conv_out.weight[:3, :, :, :] = old_conv_out.weight
-                nn.init.xavier_uniform_(new_conv_out.weight[3:, :, :, :])
-            new_conv_out.bias.zero_()
-
-        vae.decoder.conv_out = new_conv_out
-        vae.config.out_channels = out_channels
-        print(f"🔧 Updated decoder output conv → {out_channels} channels")
-
-    # --- Adjust latent_channels ---
-    if latent_channels != vae.config.latent_channels:
-        print(f"🔧 Expanding latent_channels {vae.config.latent_channels} → {latent_channels}")
-
-        # Encoder conv_out (μ + logvar)
-        old_enc_out = vae.encoder.conv_out
-        new_enc_out = nn.Conv2d(
-            old_enc_out.in_channels,
-            latent_channels * 2,
-            kernel_size=old_enc_out.kernel_size,
-            stride=old_enc_out.stride,
-            padding=old_enc_out.padding
-        )
-        with torch.no_grad():
-            # copy old
-            new_enc_out.weight[:old_enc_out.out_channels] = old_enc_out.weight
-            new_enc_out.bias[:old_enc_out.out_channels] = old_enc_out.bias
-
-            # init extras (first half = mean, second half = logvar)
-            extra_mean = latent_channels - vae.config.latent_channels
-            extra_logvar = latent_channels - vae.config.latent_channels
-
-            # mean
-            nn.init.normal_(new_enc_out.weight[old_enc_out.out_channels:old_enc_out.out_channels+extra_mean], 0.0, 1e-4)
-            nn.init.zeros_(new_enc_out.bias[old_enc_out.out_channels:old_enc_out.out_channels+extra_mean])
-
-            # logvar
-            nn.init.normal_(new_enc_out.weight[old_enc_out.out_channels+extra_mean:], 0.0, 1e-4)
-            nn.init.constant_(new_enc_out.bias[old_enc_out.out_channels+extra_mean:], -1.0)
-
-        vae.encoder.conv_out = new_enc_out
-
-        # Decoder conv_in
-        old_dec_in = vae.decoder.conv_in
-        new_dec_in = nn.Conv2d(
-            latent_channels,
-            old_dec_in.out_channels,
-            kernel_size=old_dec_in.kernel_size,
-            stride=old_dec_in.stride,
-            padding=old_dec_in.padding
-        )
-        with torch.no_grad():
-            new_dec_in.weight[:, :old_dec_in.in_channels, :, :] = old_dec_in.weight
-            nn.init.normal_(new_dec_in.weight[:, old_dec_in.in_channels:, :, :], 0.0, 1e-4)
-            new_dec_in.bias = nn.Parameter(old_dec_in.bias.clone())
-        vae.decoder.conv_in = new_dec_in
-
-        # Quant conv
-        if vae.quant_conv is not None:
-            old_qconv = vae.quant_conv
-            new_qconv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, kernel_size=1)
-            with torch.no_grad():
-                in_ch = min(old_qconv.in_channels, new_qconv.in_channels)
-                out_ch = min(old_qconv.out_channels, new_qconv.out_channels)
-                new_qconv.weight[:out_ch, :in_ch] = old_qconv.weight[:out_ch, :in_ch]
-                new_qconv.bias[:out_ch] = old_qconv.bias[:out_ch]
-                nn.init.normal_(new_qconv.weight[out_ch:], 0.0, 1e-4)
-                nn.init.zeros_(new_qconv.bias[out_ch:])
-            vae.quant_conv = new_qconv
-
-        # Post quant conv
-        if vae.post_quant_conv is not None:
-            old_pqconv = vae.post_quant_conv
-            new_pqconv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
-            with torch.no_grad():
-                in_ch = min(old_pqconv.in_channels, new_pqconv.in_channels)
-                out_ch = min(old_pqconv.out_channels, new_pqconv.out_channels)
-                new_pqconv.weight[:out_ch, :in_ch] = old_pqconv.weight[:out_ch, :in_ch]
-                new_pqconv.bias[:out_ch] = old_pqconv.bias[:out_ch]
-                nn.init.normal_(new_pqconv.weight[out_ch:], 0.0, 1e-4)
-                nn.init.zeros_(new_pqconv.bias[out_ch:])
-            vae.post_quant_conv = new_pqconv
-
-        vae.config.latent_channels = latent_channels
-
-    print("✅ Custom VAE ready")
-    print(f"Final config: in={vae.config.in_channels}, out={vae.config.out_channels}, latent={vae.config.latent_channels}")
-
-    return vae
-
 
 
 
 if __name__ == '__main__':
 
     image_key = args.input_modality
-
+    
     
     # Image
     image_save_root = "./image_result/step1_ae_train/"
@@ -501,25 +360,21 @@ if __name__ == '__main__':
     # ---------------- Define Dataloader ----------------
     in_channels = len(image_key)  # 4 channels:
     dimension = 2
-
+    latent_channels = 16  # 4, 8, 16
     spatial_size = (144, 144)    # (256, 256, 64)
     # spatial_size = (256, 256)  # bs = 8
 
     key_to_load  = []         
     key_to_load.extend(image_key)
 
-
-
-
     train_loader, train_ds     = create_paired_dataloader(csv_path=args.dataset_csv, split="train", batch_size=args.batch_size, spatial_size=spatial_size)
     test_loader,  test_ds      = create_paired_dataloader(csv_path=args.dataset_csv, split="test",  batch_size=args.batch_size, spatial_size=spatial_size)
-
 
 
     # ---------------- Define AutoEncoder Model ----------------
     autoencoder   = define_2DAE(in_channels=in_channels * 2, 
                                 out_channels=in_channels,
-                                latent_channels = 16).to(DEVICE).float()
+                                latent_channels = latent_channels).to(DEVICE).float()
 
 
     discriminator = init_patch_discriminator(args.disc_ckpt, 
@@ -557,7 +412,7 @@ if __name__ == '__main__':
     use_kl_loss       = True
 
     adv_weight        = 0.025
-    perceptual_weight = 0.1 # if  args.use_broken else 0.0  # 0.1  
+    perceptual_weight = 0.1     # if  args.use_broken else 0.0  # 0.1  
     kl_weight         = 1e-7  # 1e-7
 
     def charbonnier(x, y, eps=1e-3):
@@ -665,13 +520,12 @@ if __name__ == '__main__':
                 ct, ct_mean, ct_std    = standard_normalize(ct)
                 ctc, ctc_mean, ctc_std = standard_normalize(ctc)
 
-            # print("CT stat:",  ct.min(), ct.max(), ct.mean())
-            # print("CTC stat:", ctc.min(), ctc.max(), ctc.mean())
             zero_ctc     = torch.zeros_like(ctc).to(DEVICE)
             one_ctc      = torch.ones_like(ctc).to(DEVICE)
 
             if use_broken:
                 input_ct_ctc     = torch.cat([ct, ctc, one_ctc, one_ctc], dim=1)
+
                 if np.random.rand() < 0.5:
                     input_ct         = torch.cat([ct, zero_ctc, one_ctc, zero_ctc], dim=1)
                     input_images     = torch.cat([input_ct, input_ct_ctc], dim=0)         # This is Input
@@ -785,7 +639,10 @@ if __name__ == '__main__':
                 return weight * kl.mean()
 
             if use_broken:
-                loss_latent = kl_gaussians(z_mu_ct.float(), z_std_ct.float(), z_mu_ctc.detach().float(), z_std_ctc.detach().float())
+                loss_latent = kl_gaussians(z_mu_ct.float(), 
+                                           z_std_ct.float(), 
+                                           z_mu_ctc.detach().float(), 
+                                           z_std_ctc.detach().float())
             else:
                 loss_latent = torch.tensor(0)
 

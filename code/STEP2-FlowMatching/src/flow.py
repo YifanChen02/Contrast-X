@@ -162,47 +162,72 @@ References
 ----------
 [1] Improving and Generalizing Flow-Based Generative Models with minibatch optimal transport, Preprint, Tong et al.
 """
+# def compute_xt(x0, x1, t, sigma_min=0.1):
+#     """
+#     Sample from the time-dependent density p_t
+#         xt ~ N(alpha_t * x1 + sigma_t * x0, sigma_min * I),
+#     according to Eq. (1) in [3] and for the linear schedule Eq. (14) in [2].
+
+#     Args:
+#         x0 : shape (bs, *dim), represents the source minibatch (noise)
+#         x1 : shape (bs, *dim), represents the target minibatch (data)
+#         t  : shape (bs,) represents the time in [0, 1]
+#     Returns:
+#         xt : shape (bs, *dim), sampled point along the time-dependent density p_t
+#     """
+#     t = pad_v_like_x(t, x0)
+#     alpha_t = schedule.alpha_t(t)
+#     sigma_t = schedule.sigma_t(t)
+#     xt = alpha_t * x1 + sigma_t * x0
+#     if sigma_min > 0:
+#         xt += sigma_min * torch.randn_like(xt)
+#     return xt
+
+
+# def compute_ut(x0, x1, t):
+#     """
+#     Compute the time-dependent conditional vector field
+#         ut = alpha_dt_t * x1 + sigma_dt_t * x0,
+#     see Eq. (7) in [3].
+
+#     Args:
+#         x0 : Tensor, shape (bs, *dim), represents the source minibatch (noise)
+#         x1 : Tensor, shape (bs, *dim), represents the target minibatch (data)
+#         t  : FloatTensor, shape (bs,) represents the time in [0, 1]
+#     Returns:
+#         ut : conditional vector field
+#     """
+#     t = pad_v_like_x(t, x0)
+#     alpha_dt_t = schedule.alpha_dt_t(t)
+#     sigma_dt_t = schedule.sigma_dt_t(t)
+#     return alpha_dt_t * x1 + sigma_dt_t * x0
+
+
+
 def compute_xt(x0, x1, t, sigma_min=0.1):
     """
-    Sample from the time-dependent density p_t
-        xt ~ N(alpha_t * x1 + sigma_t * x0, sigma_min * I),
-    according to Eq. (1) in [3] and for the linear schedule Eq. (14) in [2].
-
-    Args:
-        x0 : shape (bs, *dim), represents the source minibatch (noise)
-        x1 : shape (bs, *dim), represents the target minibatch (data)
-        t  : shape (bs,) represents the time in [0, 1]
-    Returns:
-        xt : shape (bs, *dim), sampled point along the time-dependent density p_t
+    Stochastic interpolation (rectified flow):
+    x_t = (1 - t) * x0 + t * x1 + sigma(t) * eps
     """
     t = pad_v_like_x(t, x0)
-    alpha_t = schedule.alpha_t(t)
-    sigma_t = schedule.sigma_t(t)
-    xt = alpha_t * x1 + sigma_t * x0
-    if sigma_min > 0:
-        xt += sigma_min * torch.randn_like(xt)
-    return xt
+    sigma_t = sigma_min * torch.sqrt(t * (1 - t))   # schedule
+    eps = torch.randn_like(x0)
+    xt = (1 - t) * x0 + t * x1 + sigma_t * eps
+    return xt, eps, sigma_t
 
 
-def compute_ut(x0, x1, t):
+def compute_ut(x0, x1, t, eps, sigma_t, sigma_min=0.1):
     """
-    Compute the time-dependent conditional vector field
-        ut = alpha_dt_t * x1 + sigma_dt_t * x0,
-    see Eq. (7) in [3].
-
-    Args:
-        x0 : Tensor, shape (bs, *dim), represents the source minibatch (noise)
-        x1 : Tensor, shape (bs, *dim), represents the target minibatch (data)
-        t  : FloatTensor, shape (bs,) represents the time in [0, 1]
-    Returns:
-        ut : conditional vector field
+    Velocity field for rectified flow:
+    u_t = (x1 - x0) + sigma'(t) * eps
     """
     t = pad_v_like_x(t, x0)
-    alpha_dt_t = schedule.alpha_dt_t(t)
-    sigma_dt_t = schedule.sigma_dt_t(t)
-    return alpha_dt_t * x1 + sigma_dt_t * x0
 
+    # sigma(t) = sigma_min * sqrt(t * (1 - t))
+    sigma_dt = sigma_min * (0.5 - t) / torch.sqrt(t * (1 - t) + 1e-8)
 
+    ut = (x1 - x0) + sigma_dt * eps
+    return ut
 
 
 

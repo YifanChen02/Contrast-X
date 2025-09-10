@@ -241,10 +241,20 @@ if __name__ == '__main__':
 
             # ct           = batch['CT'].to(DEVICE)
             images = torch.cat([ct, ctc], dim=1)
-            
-            ctc          = torch.zeros_like(batch['CTC']).to(DEVICE)
+            # ctc_im       = batch['CTC'].to(DEVICE)
+
+            # ------------------------- Broken Latent -----------------------
+            ctc_zero          = torch.zeros_like(batch['CTC']).to(DEVICE)
             # input_ct_ctc     = torch.cat([ct, ctc, one_matrix, one_matrix], dim=1)
-            images_ct       = torch.cat([ct, ctc, one_matrix, zero_matrix], dim=1)
+            images_ct       = torch.cat([ct, ctc_zero, one_matrix, zero_matrix], dim=1)
+            # images_ct       = torch.cat([ct, ct, one_matrix, one_matrix], dim=1)
+
+            # print("ct latent:", ct.shape, ct.min(), ct.max(), ct.mean(), ct.std())
+            # print("ctc latent:", ctc.shape, ctc.min(), ctc.max(), ctc.mean(), ctc.std())
+            # print("MAE between CT and CTC:", torch.mean(torch.abs(ct - ctc)).item())
+
+
+
             images_ct = images_ct.to(DEVICE)
             
 
@@ -272,7 +282,7 @@ if __name__ == '__main__':
             gc.collect()
             torch.cuda.empty_cache()
 
-            if ids == 1:
+            if ids%100 == 1:
                 # Decode
                 dec_out = autoencoder.decode(z_mu)              # DecoderOutput
                 reconstruction = dec_out.sample
@@ -327,10 +337,51 @@ if __name__ == '__main__':
 
                 if use_standard_norm:
                     # denormalize reconstructions for visualization
-                    reconstruction = denormalize(reconstruction, ct_mean, ct_std).cpu().numpy()
-                    images         = denormalize(images,         ct_mean, ct_std).cpu().numpy()
+                    # if not isinstance(reconstruction, torch.Tensor):
+                    #     reconstruction = torch.from_numpy(reconstruction)
+
+                    images = images.cpu().numpy()
+                    ct_mean, ct_std       = ct_mean.cpu().numpy(), ct_std.cpu().numpy()
+
+                    reconstruction = denormalize(reconstruction, ct_mean, ct_std)#.cpu().numpy()
+                    images         = denormalize(images,         ct_mean, ct_std)#.cpu().numpy()
                     reconstruction = np.clip(reconstruction, 0, 1)
                     images         = np.clip(images,         0, 1)
+
+
+                from skimage.metrics import peak_signal_noise_ratio as psnr
+                from skimage.metrics import structural_similarity as ssim
+                modality_names = ["CT", "CTC", "Golden"]
+
+
+                psnr_scores = [[] for _ in range(C+1)]
+                ssim_scores = [[] for _ in range(C+1)]
+
+                for b in range(B):
+                    for c in range(C):
+                        target = images[b, c]
+                        pred   = reconstruction[b, c]
+
+                        rng = target.max() - target.min() if target.max() > target.min() else 1.0
+
+                        psnr_scores[c].append(psnr(target, pred, data_range=rng))
+                        ssim_scores[c].append(ssim(target, pred, data_range=rng))
+
+                        psnr_scores[2].append(psnr(images[b, 0], images[b, 1], data_range=rng))
+                        ssim_scores[2].append(ssim(images[b, 0], images[b, 1], data_range=rng))
+
+                # Print nicely
+                print(f"\n[Validation Summary over Epochs {0}]")
+                print("-" * 80)
+                print(f"{'Modality':15} | {'PSNR':18} | {'SSIM':18}")
+                print("-" * 80)
+
+                for c, name in enumerate(modality_names):
+                    psnr_mean = np.mean(psnr_scores[c]) if psnr_scores[c] else float("nan")
+                    ssim_mean = np.mean(ssim_scores[c]) if ssim_scores[c] else float("nan")
+                    print(f"{name:15} | {psnr_mean:.3f}{'':12} | {ssim_mean:.3f}{'':12}")
+                
+                print("-" * 80)
 
                 for i in range(B):
                     rec_i = as_CHW(reconstruction[i])  # (C,H,W)

@@ -39,4 +39,8 @@ python s5_3D_to_2D.py --input /date/hao/PairedContrast/CT/low_256x256_2.5xD  \
 
 
 
-python s6_gen_2D_csv.py   --root /date/hao/PairedContrast/CT/low_256x256_2Dimension  --out files/2D_CT_pair.csv
+python s6_gen_2D_csv_ct.py   --root /date/hao/PairedContrast/CT/low_256x256_2Dimension  --out files/2D_CT_pair.csv
+
+
+
+python s6_gen_2D_csv_dce.py   --root /date/yifanchen/data_no_mask/2D_jpg/Breast_split_slice_jpg  --out files/2D_DCE_pair.csv

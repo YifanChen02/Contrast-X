@@ -62,6 +62,66 @@ from monai.networks.schedulers.ddim import DDIMPredictionType
 
 
 
+
+import torch
+
+class TimeScheduler:
+    def __init__(self, device=DEVICE, sigma_min=0.05, sigma_max=1.0):
+        """
+        device: torch device
+        sigma_min: minimum noise scale
+        sigma_max: maximum noise scale (for inference schedule)
+        """
+        self.device = device
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+
+    # ---------------- TRAINING ---------------- #
+    def sample_train_t(self, batch_size, method="uniform", eps=1e-3):
+        """
+        Sample timesteps for training.
+        method: "uniform" or "beta"
+        eps: avoid exactly 0 or 1
+        """
+        if method == "uniform":
+            t = torch.rand(batch_size, device=self.device)
+        elif method == "beta":
+            t = torch.distributions.Beta(2.0, 2.0).sample((batch_size,)).to(self.device)
+        else:
+            raise ValueError(f"Unknown training sampling method: {method}")
+        return torch.clamp(t, eps, 1 - eps)
+
+    # ---------------- INFERENCE ---------------- #
+    def sigma_of_t(self, t):
+        """σ(t) = σ_min * sqrt(t * (1 - t))"""
+        return self.sigma_min * torch.sqrt(t * (1 - t))
+
+    def invert_sigma(self, sigma, num_points=10000):
+        """
+        Numerically invert σ(t) → t by lookup.
+        """
+        t_grid = torch.linspace(0, 1, num_points, device=self.device)
+        sigma_grid = self.sigma_of_t(t_grid)
+        idx = torch.argmin((sigma_grid[:, None] - sigma[None, :]).abs(), dim=0)
+        return t_grid[idx]
+
+    def make_inference_t_steps(self, num_steps):
+        """
+        Make inference timesteps using log-uniform σ schedule.
+        """
+        sigmas = torch.exp(
+            torch.linspace(torch.log(torch.tensor(self.sigma_max, device=self.device)),
+                           torch.log(torch.tensor(self.sigma_min, device=self.device)),
+                           num_steps, device=self.device)
+        )
+        t_steps = self.invert_sigma(sigmas)
+        return t_steps
+
+
+
+t_schedule = TimeScheduler(device=DEVICE, sigma_min=0.05, sigma_max=1.0)
+
+
 @torch.no_grad()
 def sample_using_diffusion(
         autoencoder: nn.Module,
@@ -74,54 +134,82 @@ def sample_using_diffusion(
         schedule: str = 'scaled_linear_beta',
         beta_start: float = 0.0015,
         beta_end: float = 0.0205,
-        verbose: bool = True
+        verbose: bool = True,
+        epoch: int = 0,                   # save plot per epoch
+        save_dir: str = "error_plot"      # save directory
 ) -> torch.Tensor:
     """
     Sampling random brain MRIs that follow the covariates in `context`.
-
-    Args:
-        autoencoder (nn.Module): the KL autoencoder
-        diffusion (nn.Module): the UNet
-        context (torch.Tensor): the covariates
-        device (str): the device ('cuda' or 'cpu')
-        scale_factor (int, optional): the scale factor (see Rombach et Al, 2021). Defaults to 1.
-        num_training_steps (int, optional): T parameter. Defaults to 1000.
-        num_inference_steps (int, optional): reduced T for DDIM sampling. Defaults to 50.
-        schedule (str, optional): noise schedule. Defaults to 'scaled_linear_beta'.
-        beta_start (float, optional): noise starting level. Defaults to 0.0015.
-        beta_end (float, optional): noise ending level. Defaults to 0.0205.
-        verbose (bool, optional): print progression bar. Defaults to True.
-    Returns:
-        torch.Tensor: the inferred follow-up MRI
+    Tracks MAE vs timestep and saves as a plot.
     """
 
+    # initialize latent with x0
+    z = x0.clone()
 
-    # x0, x1,
-    z = x0
-    t_steps = torch.linspace(0.0, 1.0, num_inference_steps, device=device)
+    # Linear
+    t_steps = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device)
+    # dt = t_steps[1] - t_steps[0]
+
+    # sigma_max = 1.0    # largest noise (you can tune)
+    # sigma_min = 0.001  # smallest noise
+
+    # # log-uniform interpolation of σ
+    # sigmas = torch.exp(
+    #     torch.linspace(torch.log(torch.tensor(sigma_max)),
+    #                 torch.log(torch.tensor(sigma_min)),
+    #                 num_inference_steps+1, device=device)
+    # )
+    # t_steps = invert_sigma(sigmas, sigma_min=0.05, device=device)
+
+    # Beta(2,2)
+
+    # t_steps = t_schedule.make_inference_t_steps(num_inference_steps + 1)
 
 
-    progress_bar = tqdm(range(len(t_steps)), desc="Sampling", disable=not verbose)
+    mae_values = []  # store MAE per timestep
+    mae_values = []
+    progress_bar = tqdm(range(num_inference_steps), desc="Sampling", disable=not verbose)
 
-    dt = t_steps[1] - t_steps[0] 
+    for i in progress_bar:
+        dt = t_steps[i+1] - t_steps[i]
 
+        timestep = t_steps[i].expand(z.shape[0])  # match batch size
+        v = diffusion(z.float(), timestep)
 
-    for i, t in enumerate(progress_bar):
-        with torch.no_grad(), accelerator.autocast():
-            timestep = torch.tensor([t_steps[i]]).to(device)
-            
-            v = diffusion(x=z.float(), timesteps=timestep,)  # [B, C, ...] = v(x_t, t)
+        z = z + v * dt  # Euler update
 
-            z = z + v * dt
+        mae = torch.mean(torch.abs(z - x1)).item()
+        mae_values.append(mae)
 
-    # decode the latent
-    z = z / scale_factor
-    # z = utils.to_vae_latent_trick(z.cpu(), unpadded_z_shape=(z.shape[0], 4, *[s // 2 for s in spatial_size]))
-    x = autoencoder.decode(z.to(device)).sample.cpu()  #.sample.cpu().squeeze(1)
+    # final decoded output
+    z = z / scale_factor[1]
+    x = autoencoder.decode(z.to(device)).sample.cpu()
+
+    # -------------------
+    # Plot MAE vs timestep
+    # -------------------
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"img_epoch{epoch:04d}.png")
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(range(num_inference_steps), mae_values, marker="o")
+    plt.xlabel("Diffusion Timestep")
+    plt.ylabel("Mean Absolute Error (MAE)")
+    plt.title(f"MAE vs. Diffusion Timestep (Epoch {epoch})")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+
+    print(
+        "MAE Stats:",
+        "start =", mae_values[0],
+        "end =", mae_values[-1],
+        "min =", min(mae_values),
+        "max =", max(mae_values)
+    )
+
 
     return x
-
-
 
 mask_key       = "mask"
 latent_key     = "CTC"
@@ -243,35 +331,50 @@ def save_(image, save_root, epoch=0, modality_names=None, fname="stacked.png"):
     print(f"✅ Validation Saved: {out_path}")
 
 
+from pathlib import Path
 def stack_and_save(image_np, recon_broken, recon_np, save_root, epoch, modality_names):
     """
-    Stack [original, broken, recon] images for visualization.
+    Save a grid of [original, broken, recon] for each modality, with labels.
 
     Args:
         image_np, recon_broken, recon_np: np.ndarray (B, C, H, W)
-        save_root (str): output directory
+        save_root (str | Path): output directory
         epoch (int): current epoch
-        modality_names (list[str]): names for modalities
+        modality_names (list[str]): names for modalities (len = C)
     """
-    image_stacked = []
-    for b in range(min(image_np.shape[0], 3)):  # only save up to 3 samples
-        image_c = []
-        for c in range(image_np.shape[1]):
-            # horizontally concat triplet
-            image_c.append(image_np[b, c])
-            image_c.append(recon_broken[b, c])
-            image_c.append(recon_np[b, c])
+    B, C, H, W = image_np.shape
+    ncols = 3 * C                # Original, Broken, Recon for each modality
+    nrows = min(B, 3)             # up to 3 samples
 
-        # stack modalities vertically → (C*H, 3*W)
-        image_c = np.concatenate(image_c, axis=-1)
-        image_stacked.append(image_c)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+    axs = np.atleast_2d(axs)
 
-    # stack batch samples vertically → (B*C*H, 3*W)
-    image_stacked = np.concatenate(image_stacked, axis=0)
+    # set column headers
+    for c, modality in enumerate(modality_names[:C]):
+        axs[0, 3*c].set_title(f"{modality} - Original")
+        axs[0, 3*c+1].set_title(f"{modality} - Broken")
+        axs[0, 3*c+2].set_title(f"{modality} - Recon")
 
-    # save
-    save_(image_stacked, save_root, epoch=epoch, fname="stacked.png",
-        modality_names=modality_names[:image_np.shape[1]])
+    for b in range(nrows):
+        for c in range(C):
+            axs[b, 3*c].imshow(image_np[b, c], cmap="gray", vmin=0, vmax=1)
+            axs[b, 3*c+1].imshow(recon_broken[b, c], cmap="gray", vmin=0, vmax=1)
+            axs[b, 3*c+2].imshow(recon_np[b, c], cmap="gray", vmin=0, vmax=1)
+
+            # remove axes
+            axs[b, 3*c].axis("off")
+            axs[b, 3*c+1].axis("off")
+            axs[b, 3*c+2].axis("off")
+
+    plt.tight_layout()
+    save_root = Path(save_root)
+    save_root.mkdir(parents=True, exist_ok=True)
+    save_path = save_root / f"stacked_epoch{epoch}.png"
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print("Saved grid with labels to", save_path)
+
+
 
 
 use_standard_norm = True 
@@ -334,7 +437,6 @@ def images_to_tensorboard(
     """
     Visualize the generation on tensorboard
     """
-    
 
     ct_img = batch["CT_img"]
     ctc_img = batch["CTC_img"]
@@ -343,30 +445,33 @@ def images_to_tensorboard(
         ct_img, ct_mean, ct_std    = standard_normalize(ct_img)
         ctc_img, ctc_mean, ctc_std = standard_normalize(ctc_img)
 
-    x0 = batch[latent_key].to(DEVICE).clone() * scale_factor
-    x1 = batch[broken_latent_key].to(DEVICE).clone() * scale_factor
+    x0 = batch[broken_latent_key].to(DEVICE).clone() * scale_factor[0]
+    x1 = batch[latent_key].to(DEVICE).clone()        * scale_factor[1]
 
-    # print("inputs_latents = ", inputs_latents.shape, "context = ", context.shape)
-
-    ae = autoencoder.module if hasattr(autoencoder, "module") else autoencoder
+    ae = autoencoder  # .module if hasattr(autoencoder, "module") else autoencoder
 
     with torch.no_grad(), accelerator.autocast():
         image = sample_using_diffusion(
-            autoencoder=ae,
+            autoencoder=autoencoder,
             diffusion=diffusion,
             x0=x0, #inputs_latents,
             x1=x1,
             num_inference_steps=100,
             device=DEVICE,
-            scale_factor=scale_factor
+            scale_factor=scale_factor,
+            epoch=epoch
         )
 
-        recon_origin = ae.decode(x0 / scale_factor).sample.cpu().numpy()  # [B, 1, H, W]
-        recon_broken = ae.decode(x1 / scale_factor).sample.cpu().numpy()  # [B, 1, H, W]
+        recon_broken = ae.decode(x0 / scale_factor[0]).sample.cpu().numpy()  # [B, 1, H, W]
+        recon_target = ae.decode(x1 / scale_factor[1]).sample.cpu().numpy()  # [B, 1, H, W]
 
 
-    image_np     = recon_origin  #.cpu().numpy()  # [B, 1, H, W]
+
+    image_np     = recon_target  #.cpu().numpy()  # [B, 1, H, W]
+    recon_broken = recon_broken  #.cpu().numpy()  # [B, 1, H, W]
     recon_np     = image.cpu().numpy()  #.max(axis=1, keepdims=True)  # [B, 3, H, W] -> [B, 1, H, W]
+
+
 
     save_root = "./fm_samples"
     os.makedirs(save_root, exist_ok=True)
@@ -377,9 +482,9 @@ def images_to_tensorboard(
     if use_standard_norm:
         ct_mean = ct_mean.cpu().numpy()
         ct_std  = ct_std.cpu().numpy()
-        recon_np = denormalize(recon_np, ct_mean, ct_std) #.cpu().numpy()
+        recon_np     = denormalize(recon_np, ct_mean, ct_std) #.cpu().numpy()
         recon_broken = denormalize(recon_broken, ct_mean, ct_std)#.cpu().numpy()
-        image_np = denormalize(image_np, ct_mean, ct_std)#.cpu().numpy
+        image_np     = denormalize(image_np, ct_mean, ct_std)#.cpu().numpy
 
     # print("image_np[b] =", image_np[b].shape, recon_broken[b].shape, recon_np[b].shape, context_np[b].shape)
     stack_and_save(image_np, recon_broken, recon_np, save_root, epoch, modality_names)
@@ -418,12 +523,24 @@ def images_to_tensorboard(
                 rng = target.max() - target.min() if target.max() > target.min() else 1.0
 
                 # Fake vs Target
-                psnr_after[c].append(psnr(target, fake_img, data_range=rng))
-                ssim_after[c].append(ssim(target, fake_img, data_range=rng))
+                psnr_after[c].append(psnr(target,  fake_img, data_range=rng))
+                ssim_after[c].append(ssim(target,  fake_img, data_range=rng))
 
                 # Input vs Target
                 psnr_before[c].append(psnr(target, input_img, data_range=rng))
                 ssim_before[c].append(ssim(target, input_img, data_range=rng))
+
+
+        # Inout
+        ctc_fake_vs_ct_true_psnr, ctc_fake_vs_ct_true_ssim = [], []
+        if C >= 2:
+            for b in range(B):
+                target = image_np[b, 0]   # CT True
+                fake   = recon_np[b, 1]   # CTC Fake
+                rng = target.max() - target.min() if target.max() > target.min() else 1.0
+                ctc_fake_vs_ct_true_psnr.append(psnr(target, fake, data_range=rng))
+                ctc_fake_vs_ct_true_ssim.append(ssim(target, fake, data_range=rng))
+            
 
         # Print nicely
         print(f"\n[Validation Summary over Epochs {idx}]")
@@ -432,27 +549,43 @@ def images_to_tensorboard(
         print("----------------------------------------------------------------------------------------------------")
         for c, name in enumerate(modality_names):
             print(f"{name:15} | {np.mean(psnr_after[c]):.3f}{'':12} | {np.mean(psnr_before[c]):.3f}{'':12} | {np.mean(ssim_after[c]):.3f}{'':12} |  {np.mean(ssim_before[c]):.3f}{'':12}")
+        
         print("----------------------------------------------------------------------------------------------------")
 
+       
+        print(f"\n[Cross-Modality Comparison]")
+        print("----------------------------------------------------------------------------------------------------")
+        print(f"{'Comparison':15} | {'Fake→CT True PSNR':18} | {'Fake→CT True SSIM':18}")
+        print("----------------------------------------------------------------------------------------------------")
+        print(f"{'CTC Fake vs CT':15} | {np.mean(ctc_fake_vs_ct_true_psnr):.3f}{'':12} | {np.mean(ctc_fake_vs_ct_true_ssim):.3f}{'':12}")
+        print("----------------------------------------------------------------------------------------------------")
 
 
     evaluate_images_modalities(image_np, recon_broken, recon_np, modality_names=modality_names, idx=epoch)
 
 
 
+
+from src.MM_AE import AutoencoderKL_multi_encoder
+
 def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
     from huggingface_hub import snapshot_download
     from diffusers import AutoencoderKL
+
     
     from diffusers.models import AutoencoderKL
-
-    block_out_channels=(256, 512)
+    # block_out_channels=(256, 512)  # (256, 512)
+    block_out_channels=(128, 256)  # (256, 512)
     layers_per_block = 3
+
+    # block_out_channels=(128, 128, 256) # 128, 256
+    # layers_per_block = 2
 
     n_blocks = len(block_out_channels)
 
-    vae = AutoencoderKL(
-        in_channels=in_channels, out_channels=out_channels, latent_channels=latent_channels,
+    vae = AutoencoderKL_multi_encoder(
+        num_encode = in_channels,
+        in_channels=1, out_channels=out_channels, latent_channels=latent_channels,
         block_out_channels=block_out_channels, 
         down_block_types=("DownEncoderBlock2D",) * n_blocks,
         up_block_types=("UpDecoderBlock2D",) * n_blocks,
@@ -512,16 +645,23 @@ if __name__ == '__main__':
     latent_root  = args.latent_dir  # wherever you want latents
     spatial_size = [256, 256]  # 512 or 256
 
-    train_loader, train_ds     = create_paired_dataloader(csv_path=args.dataset_csv, 
+    target_dataset = ["Adrenal"]
+    # target_dataset = ["Adrenal", "Bladder", "Lung", "Stomach", "Uterus"]
+
+    image_key_str +=  "-" + "-".join(target_dataset)
+
+
+    train_loader, train_ds     = create_paired_dataloader(csv_path=args.dataset_csv, target_dataset=target_dataset, 
                                                           data_root=data_root, out_root=latent_root,
                                                           split="train", batch_size=args.batch_size, spatial_size=spatial_size)
-    test_loader,  test_ds      = create_paired_dataloader(csv_path=args.dataset_csv, data_root=data_root, out_root=latent_root,
-                                                          split="test",  batch_size=args.batch_size, spatial_size=spatial_size)
+    test_loader,  test_ds      = create_paired_dataloader(csv_path=args.dataset_csv, target_dataset=target_dataset, 
+                                                          data_root=data_root, out_root=latent_root,
+                                                          split="test",  batch_size=4 * args.batch_size, spatial_size=spatial_size)
 
 
     in_channels = len(image_key)
     print("Setting up Autoencoder model...")
-    autoencoder   = define_2DAE(in_channels=in_channels * 2, 
+    autoencoder   = define_2DAE(in_channels=in_channels, 
                                 out_channels=in_channels,
                                 latent_channels = 16).to(DEVICE).float()
     
@@ -538,8 +678,26 @@ if __name__ == '__main__':
     autoencoder.to(DEVICE)
     autoencoder.eval()  # Important for inference
 
+    # from generative.networks.nets import DiffusionModelUNet
+    # in_channels=16
+    # model = DiffusionModelUNet(
+    #     spatial_dims=2,  # 2D
+    #     in_channels=in_channels,  # x
+    #     out_channels=in_channels,  # predice delta_x_t
+    # )
+
 
     diffusion = networks.init_latent_diffusion(args, in_channels=16, use_image=False, spatial_dims=dimension).to(DEVICE)
+
+    if args.diff_ckpt:
+        print("Loading diffusion checkpoint:", args.diff_ckpt)
+        weight = torch.load(args.diff_ckpt, map_location=DEVICE)
+        weight = remove_module_prefix(weight)
+        diffusion.load_state_dict(weight, strict=True)
+        print("=> Loaded Diffusion successfully.")
+    else:
+        print(f"=> No diffusion checkpoint provided, using random init for diffusion model.")
+
     optimizer = torch.optim.AdamW(diffusion.parameters(), lr=args.lr, weight_decay=1e-6)  # AdamW
 
     scheduler_g = torch.optim.lr_scheduler.CyclicLR(
@@ -552,17 +710,29 @@ if __name__ == '__main__':
     )
 
     a = train_loader.dataset[0][latent_key]
+    rate_num = 25
 
+    scale_factor = []
     with torch.no_grad(), accelerator.autocast():
-        z_list = [train_loader.dataset[i][latent_key] for i in range(5)]
+        z_list = [train_loader.dataset[i][latent_key] for i in range(rate_num)]
         z = torch.stack(z_list, dim=0)  # Stack into a single tensor
+        scale_factor_full = 1 / torch.std(z)  
 
+        z_list = [train_loader.dataset[i][broken_latent_key] for i in range(rate_num)]
+        z = torch.stack(z_list, dim=0)  # Stack into a single tensor
+        scale_factor_broken = 1 / torch.std(z)  
+        scale_factor = [scale_factor_broken, scale_factor_full]
 
-    scale_factor = 1 / torch.std(z)  
     print(f"Scaling factor set to {scale_factor}")
 
-    autoencoder, optimizer, train_loader, diffusion, scheduler_g = accelerator.prepare(
-        autoencoder, optimizer, train_loader, diffusion, scheduler_g
+    from monai.losses import PerceptualLoss
+    perc_loss_fn = PerceptualLoss(spatial_dims=dimension,
+                                      network_type="squeeze",
+                                      is_fake_3d=True if dimension == 3 else False).to(DEVICE)
+
+                                      
+    autoencoder, optimizer, train_loader, diffusion, scheduler_g, autoencoder.encode, autoencoder.decode, perc_loss_fn = accelerator.prepare(
+        autoencoder, optimizer, train_loader, diffusion, scheduler_g, autoencoder.encode, autoencoder.decode, perc_loss_fn
     )
 
     # writer   = SummaryWriter()
@@ -570,9 +740,13 @@ if __name__ == '__main__':
     loaders  = {'train': train_loader}  # , # 'valid': valid_loader }
     datasets = {'train': train_loader.dataset}  # , 'valid': validset }
 
-    ae = autoencoder.module if hasattr(autoencoder, "module") else autoencoder
+    ae = autoencoder #.module if hasattr(autoencoder, "module") else autoencoder
     gradient_accumulation_steps = args.grad_accum_steps if hasattr(args, 'grad_accum_steps') else 4  # for example
-
+    
+    for p in ae.parameters():
+        p.requires_grad = False
+    
+    ae.eval()
 
     for epoch in range(args.n_epochs):
 
@@ -584,6 +758,9 @@ if __name__ == '__main__':
             progress_bar.set_description(f"{mode.upper()} Epoch {epoch}")
 
             for step, batch in progress_bar:
+                if step > 500:
+                    break
+
                 if args.DEBUG and step >= 10:
                     print(f"[DEBUG] Step {step}: {batch[latent_key].shape}")
                     break
@@ -594,21 +771,55 @@ if __name__ == '__main__':
 
                     # Use to be  context: context tensor (N, 1, ContextDim).
                     B         = batch[latent_key].shape[0]
-                    t         = torch.rand(B, device=DEVICE)
-                    x0        = batch[latent_key].to(DEVICE).clone() * scale_factor
-                    x1        = batch[broken_latent_key].to(DEVICE).clone() * scale_factor
+
+                    t         = torch.rand(B, device=DEVICE)  # log-uniform?
+                    # t = torch.sigmoid(torch.randn(B, device=DEVICE))
+                    
+                    # t = t_schedule.sample_train_t(batch_size=B, method="beta")
+                    # print("t = ", t)
+
+
+                    x0        = batch[broken_latent_key].to(DEVICE).clone() * scale_factor[0]
+                    x1        = batch[latent_key].to(DEVICE).clone() * scale_factor[1]
+                    ctc_image = batch["CTC_img"].to(DEVICE)
+
+                    ctc_norm, ctc_image_mean, ctc_image_std = standard_normalize(ctc_image)
+
 
                     # x0 -> x1
-                    sigma = 0.01
-                    xt = compute_xt(x0=x0, x1=x1, t=t, sigma_min=sigma)
-                    ut = compute_ut(x0=x0, x1=x1, t=t)
-                    
-                    pred = diffusion(x=xt, timesteps=t, context=None)
+                    sigma = 0.0 # 1.0
+                    xt, eps, sigma_t = compute_xt(x0, x1, t, sigma_min=sigma)
+                    ut = compute_ut(x0, x1, t, eps, sigma_t, sigma_min=sigma)
+
+                    # x_t = (1 - t_img) * x_0 + t_img * x_1         # [B, 1, H, W]
+                    # ut = x_1 - x_0                              # [B, 1, H, W]
+
 
                     
+                    pred = diffusion(xt, t) #x=xt, timesteps=t, context=None)
 
-                    # loss = F.mse_loss(pred, ut)  # MSE Loss
+
+                    # if epoch < 10:
+                        # loss = F.mse_loss(pred, ut)  # MSE Loss
+                    # else:
+
                     loss = charbonnier_smooth_l1_loss(pred, ut)
+
+                    if epoch > 10:
+                        x1_pred = x0 + pred
+                        recon = ae.decode((x1_pred / scale_factor[1])).sample
+                        recon = recon[:, 1:2, :, :] #.unsqueeze(1)  # only CTC channel
+                        loss += 0.1 * F.l1_loss(recon, ctc_norm)
+
+                if epoch > 10:
+                    reconstruction_3ch = torch.cat([recon] * 3, dim=1)  # [B, C, H, W]
+                    images_3ch         = torch.cat([ctc_norm] * 3, dim=1)
+                    
+                    
+                    loss += 0.1 *  perc_loss_fn(
+                        reconstruction_3ch.float(),
+                        images_3ch.float().detach()
+                    )
 
 
                     # cos_loss = 1 - F.cosine_similarity(pred, ut, dim=1).mean()
@@ -642,19 +853,20 @@ if __name__ == '__main__':
             epoch_loss = epoch_loss / len(loader)
             # writer.add_scalar(f'{mode}/epoch-mse', epoch_loss, epoch)
 
+
+            accelerator.wait_for_everyone()
             # visualize results
-            images_to_tensorboard(
-                batch=batch,
-                writer=None,
-                epoch=epoch,
-                mode=mode,
-                autoencoder=autoencoder,
-                diffusion=diffusion,
-                scale_factor=scale_factor,
-                modality_names=image_key
-            )
-
-
+            if accelerator.is_main_process:
+                images_to_tensorboard(
+                    batch=batch,
+                    writer=None,
+                    epoch=epoch,
+                    mode=mode,
+                    autoencoder=autoencoder,
+                    diffusion=diffusion,
+                    scale_factor=scale_factor,
+                    modality_names=image_key
+                )
 
         # save the model                
         savepath = os.path.join(args.output_dir, f'dm-unet-ep-{epoch}-{image_key_str}.pth')

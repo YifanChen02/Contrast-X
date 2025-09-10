@@ -238,7 +238,8 @@ if __name__ == '__main__':
             
             ctc          = torch.zeros_like(batch['CTC']).to(DEVICE)
             # input_ct_ctc     = torch.cat([ct, ctc, one_matrix, one_matrix], dim=1)
-            images_ct       = torch.cat([ct, ctc, one_matrix, zero_matrix], dim=1)
+            # images_ct       = torch.cat([ct, ctc, one_matrix, zero_matrix], dim=1)
+            images_ct       = torch.cat([ct, ct, one_matrix, zero_matrix], dim=1)
             images_ct = images_ct.to(DEVICE)
             
 

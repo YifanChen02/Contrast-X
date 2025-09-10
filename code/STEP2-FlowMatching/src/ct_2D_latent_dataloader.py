@@ -11,6 +11,11 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 
+
+target_dataset = ["Adrenal"]
+# target_dataset = ["Adrenal", "Bladder", "Lung", "Stomach", "Uterus"]
+
+
 class PairedLatentDataset(Dataset):
     """
     Expects CSV with header:
@@ -25,11 +30,14 @@ class PairedLatentDataset(Dataset):
         csv_path: str,
         data_root: str,
         out_root: str,
+        target_dataset: list = target_dataset,
         split: Optional[str] = None,       # "train" | "val" | "test" | None
         spatial_size: Optional[int] = None,
         random_hflip: bool = False,
     ):
         df = pd.read_csv(csv_path)
+
+        df = df[df["Dataset"].apply(lambda x: x.split("_")[0]).isin(target_dataset)]
 
         # shuffle with fixed seed if needed
         df = df.sample(frac=1, random_state=42).reset_index(drop=True)
@@ -132,6 +140,7 @@ def create_paired_dataloader(
     csv_path: str,
     data_root: str,
     out_root: str,
+    target_dataset: list,
     split: Optional[str],
     batch_size: int = 8,
     spatial_size: Optional[int] = None,
@@ -147,6 +156,7 @@ def create_paired_dataloader(
         csv_path=csv_path,
         data_root=data_root,
         out_root=out_root,
+        target_dataset=target_dataset,
         split=split,
         spatial_size=spatial_size,
         random_hflip=random_hflip,

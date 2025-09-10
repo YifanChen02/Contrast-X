@@ -219,22 +219,41 @@ def init_latent_diffusion(args: Optional[str] = None, in_channels=4, use_image=T
     else:
         from .unet_2d import DiffusionModelUNet
 
-    latent_diffusion = DiffusionModelUNet(spatial_dims=spatial_dims,
-                                          in_channels=in_channels,
-                                          out_channels=in_channels,
-                                          num_res_blocks=2,
-                                          channels=(256, 512, 768),
-                                          attention_levels=(False, True, True),
-                                          norm_num_groups=32,
-                                          norm_eps=1e-6,
-                                          resblock_updown=True,
-                                          num_head_channels=(0, 512, 768),
+    latent_diffusion = DiffusionModelUNet(spatial_dims=spatial_dims, 
+                                          in_channels=in_channels, 
+                                          out_channels=in_channels, 
+                                          num_res_blocks=2, 
+                                          channels=(256, 256, 512, 768),
+                                          attention_levels=(False, False, True, True), 
+                                          norm_num_groups=32, 
+                                          norm_eps=1e-6, 
+                                          resblock_updown=True, 
+                                          num_head_channels=(0, 0, 64, 128), 
                                           transformer_num_layers=1,
-                                          with_conditioning=True,
-                                          cross_attention_dim=128,  # 128
-                                          num_class_embeds=None,
-                                          upcast_attention=True,
-                                          use_flash_attention=False)
+                                          with_conditioning=False,
+                                          cross_attention_dim=None,  # 128
+                                          num_class_embeds=None, 
+                                          upcast_attention=True, 
+                                          use_flash_attention=True)
+
+        # latent_diffusion = DiffusionModelUNet(spatial_dims=spatial_dims, 
+        #                                   in_channels=in_channels, 
+        #                                   out_channels=in_channels, 
+        #                                   num_res_blocks = (2, 2, 2, 2),
+        #                                   channels = (32, 64, 64, 64),
+        #                                   attention_levels=(False, False, True, True), 
+        #                                   norm_num_groups=32, 
+        #                                   norm_eps=1e-6, 
+        #                                   resblock_updown=False,  # TTrue 
+        #                                   num_head_channels = 8,
+        #                                   transformer_num_layers=1,
+        #                                   with_conditioning=False,
+        #                                   cross_attention_dim=None,  # 128
+        #                                   num_class_embeds=None, 
+        #                                   upcast_attention=False,   # False
+        #                                   use_flash_attention=True)
+
+
     return latent_diffusion
     # try:
     # return load_if(args.diff_ckpt, latent_diffusion)
