@@ -124,7 +124,6 @@ def standard_normalize(x, mean=None, std=None, eps=1e-8):
         std = x.std(dim=tuple(range(1, x.ndim)), keepdim=True) + eps
 
     x_norm = (x - mean) / std
-
     x_norm = torch.clamp(x_norm, -6, 6)
 
     return x_norm, mean, std
@@ -320,11 +319,11 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
 
     
     from diffusers.models import AutoencoderKL
-    # block_out_channels=(128, 256)  # (256, 512)
-    # layers_per_block = 3
+    block_out_channels=(128, 256)  # (256, 512)
+    layers_per_block = 3
 
-    block_out_channels=(64, 128, 256) # 128, 256
-    layers_per_block = 2
+    # block_out_channels=(64, 128, 256) # 128, 256
+    # layers_per_block = 2
 
     n_blocks = len(block_out_channels)
 
@@ -352,7 +351,7 @@ if __name__ == '__main__':
     
     
     # Image
-    image_save_root = "./image_result/step1_ae_train_dce/"
+    image_save_root = "./image_result/step1_ae_train_ct/"
     os.makedirs(image_save_root, exist_ok=True)
     
     if isinstance(image_key, (list, tuple)):
@@ -368,7 +367,7 @@ if __name__ == '__main__':
     # ---------------- Define Dataloader ----------------
     in_channels = len(image_key)  # 4 channels:
     dimension = 2
-    latent_channels = 8  # 4, 8, 16
+    latent_channels = 6  # 4, 8, 16
     spatial_size = (144, 144)    # (256, 256, 64)
     # spatial_size = (256, 256)  # bs = 8
 
@@ -421,7 +420,7 @@ if __name__ == '__main__':
 
     adv_weight        = 0.025
     perceptual_weight = 0.1     # if  args.use_broken else 0.0  # 0.1  
-    kl_weight         = 1e-7  # 1e-7
+    kl_weight         = 1e-3  # 1e-7
 
     def charbonnier(x, y, eps=1e-3):
         return torch.mean(torch.sqrt((x - y)**2 + eps**2))
@@ -522,7 +521,7 @@ if __name__ == '__main__':
             if step > 200:  # 390
                 break
 
-            ct    = batch['CT'].to(DEVICE)
+            ct     = batch['CT'].to(DEVICE)
             ctc    = batch['CTC'].to(DEVICE)
 
 
@@ -541,16 +540,30 @@ if __name__ == '__main__':
             r = np.random.rand()
             
             broken_inputs = [ct]
-            broken_modalities_mask   = [True]
-
+            broken_modalities_mask   = [True, True]
             # Randomly drop dce2 and dce3
-            
+            r = torch.rand(1).item()
+
             if np.random.rand() < 0.5:  # 50% chance to keep
-                broken_inputs = [ct, torch.zeros_like(ctc).to(DEVICE)]
-                broken_modalities_mask   = [True, False]
+                ctc_mix = ctc * r + (1 - r) * ct
+                ctc_mix = ctc_mix.detach()
+                broken_inputs.append(ctc_mix)
+                
+                if np.random.rand() < 0.5:
+                    broken_modalities_mask   = [True, False]
+                
             else:
-                broken_inputs = [torch.zeros_like(ctc).to(DEVICE), ctc]
-                broken_modalities_mask   = [False, True]
+                ct_mix = ct * r + (1 - r) * ctc
+                ct_mix = ct_mix.detach()
+
+                broken_inputs = [ct_mix, ctc]
+                if np.random.rand() < 0.5:
+                    broken_modalities_mask   = [False, True]
+
+            broken_double_images    = torch.cat([images, torch.cat(broken_inputs, dim=1)], dim=0)
+            broken_double_images    = broken_double_images.detach()
+
+            # print("broken_double_images shape=", broken_double_images.shape, double_images.shape)
 
 
             # with autocast(enabled=True):
@@ -602,10 +615,11 @@ if __name__ == '__main__':
                 rec_loss = l1_loss_fn(reconstruction, double_images)   # * 5
 
             else:
-                mask = mask.expand_as(double_images)
-                rec_loss = torch.abs(reconstruction * mask - double_images * mask).sum() / torch.sum(mask)
+                rec_loss = l1_loss_fn(reconstruction, broken_double_images) 
+                
 
-            kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) + kl_loss_fn(broken_z_mu, broken_z_sigma) )
+            kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) + \
+                                     kl_loss_fn(broken_z_mu, broken_z_sigma) )
 
             B, C, H, W = reconstruction.shape
 
@@ -613,8 +627,12 @@ if __name__ == '__main__':
             # --------------- Perceptural Loss ---------------
             recon_dce1 = reconstruction[:, 0:1].repeat(1,3,1,1)
             recon_dce2 = reconstruction[:, 1:2].repeat(1,3,1,1)
-            image_dce1 = double_images[:, 0:1].repeat(1,3,1,1)
-            image_dce2 = double_images[:, 1:2].repeat(1,3,1,1)
+            if not use_mask_loss:
+                image_dce1 = double_images[:, 0:1].repeat(1,3,1,1)
+                image_dce2 = double_images[:, 1:2].repeat(1,3,1,1)
+            else:
+                image_dce1 = broken_double_images[:, 0:1].repeat(1,3,1,1)
+                image_dce2 = broken_double_images[:, 1:2].repeat(1,3,1,1)
 
             # Duplicate each channel 3× → [B,3,H,W]
 
@@ -677,17 +695,16 @@ if __name__ == '__main__':
             loss_latent = kl_gaussians(broken_z_mu.float(), 
                                        broken_z_sigma.float(), 
                                        z_mu.detach().float(), 
-                                       z_sigma.detach().float()) + F.mse_loss(broken_z_mu, z_mu.detach())
+                                       z_sigma.detach().float()) + \
+                                       F.mse_loss(broken_z_mu, z_mu.detach())
             
             loss_latent = 0.1 * loss_latent
           
-
-
             loss_g = rec_loss + kld_loss + gen_loss + per_loss + loss_latent
 
-            progress_bar.set_postfix(loss_g=loss_g.item()      if hasattr(loss_g, "item") else loss_g,
+            progress_bar.set_postfix(loss_g=loss_g.item()         if hasattr(loss_g, "item") else loss_g,
                                         latent=loss_latent.item() if hasattr(loss_latent, "item") else loss_latent,
-                                        per_loss=per_loss.item()  if hasattr(loss_g, "item") else per_loss,
+                                        per_loss=per_loss.item()  if hasattr(per_loss, "item") else per_loss,
                                         rec_loss=rec_loss.item()  if hasattr(rec_loss, "item") else rec_loss,
                                         kld_loss=kld_loss.item()  if hasattr(kld_loss, "item") else kld_loss,
                                         gen_loss=gen_loss.item()  if hasattr(gen_loss, "item") else gen_loss)

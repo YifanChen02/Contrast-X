@@ -335,21 +335,23 @@ missing_modality = args.missing_modality
 
 from MM_AE import AutoencoderKL_multi_encoder
 
+from SM_AE import AutoencoderKL_single_encoder
+
 def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
     from huggingface_hub import snapshot_download
     from diffusers import AutoencoderKL
 
     
     from diffusers.models import AutoencoderKL
-    # block_out_channels=(128, 256)  # (256, 512)
-    # layers_per_block = 3
+    block_out_channels=(128, 256)  # (256, 512)
+    layers_per_block = 3
 
-    block_out_channels=(64, 128, 256) # 128, 256
-    layers_per_block = 2
+    # block_out_channels=(64, 128, 256) # 128, 256
+    # layers_per_block = 2
 
     n_blocks = len(block_out_channels)
 
-    vae = AutoencoderKL_multi_encoder(
+    vae = AutoencoderKL_single_encoder(
         num_encode = in_channels,
         in_channels=1, out_channels=out_channels, latent_channels=latent_channels,
         block_out_channels=block_out_channels, 
@@ -389,7 +391,7 @@ if __name__ == '__main__':
     # ---------------- Define Dataloader ----------------
     in_channels = len(image_key)  # 4 channels:
     dimension = 2
-    latent_channels = 8  # 4, 8, 16
+    latent_channels = 16  # 4, 8, 16
     spatial_size = (144, 144)    # (256, 256, 64)
     # spatial_size = (256, 256)  # bs = 8
 
@@ -436,8 +438,8 @@ if __name__ == '__main__':
             print(f"Autoencoder checkpoint not found: {gen_path}. Starting from scratch.")
         print("Resuming from checkpoint:", gen_path)
 
-    use_mask_loss     = False
-    use_adv           = True  #not args.use_broken
+    use_mask_loss     = False  # False
+    use_adv           = True  # not args.use_broken
     use_kl_loss       = True
 
     adv_weight        = 0.025
@@ -567,12 +569,18 @@ if __name__ == '__main__':
             # Randomly drop dce2 and dce3
             for dce in [dce2, dce3]:
                 if np.random.rand() < 0.5:  # 50% chance to keep
+                    r = torch.rand(1).item()  # get a single random scalar
+                    dce = dce * r + (1 - r) * dce1
+                    dce = dce.detach()
                     broken_inputs.append(dce)
                     broken_modalities_mask.append(True)
                 else:
                     broken_inputs.append(torch.zeros_like(dce).to(DEVICE))
                     broken_modalities_mask.append(False)
 
+            broken_double_images    = torch.cat([images, torch.cat(broken_inputs, dim=1)], dim=0)
+            broken_double_images    = broken_double_images.detach()
+            
 
             # with autocast(enabled=True):
             with accelerator.autocast():
@@ -611,9 +619,10 @@ if __name__ == '__main__':
                 reconstruction = torch.cat([reconstruction, broken_reconstruction], dim=0)
 
             gen_loss = torch.tensor(0).to(reconstruction.device)
-            with accelerator.autocast():
-                if use_adv:
-                    logits_fake = discriminator(reconstruction.contiguous())[-1]
+            # with accelerator.autocast():
+            
+            if use_adv:
+                logits_fake = discriminator(reconstruction.contiguous())[-1]
                     
              
             if use_adv:           
@@ -623,9 +632,8 @@ if __name__ == '__main__':
                 rec_loss = l1_loss_fn(reconstruction, double_images)   # * 5
 
             else:
-                mask = mask.expand_as(double_images)
-                rec_loss = torch.abs(reconstruction * mask - double_images * mask).sum() / torch.sum(mask)
-
+                rec_loss = l1_loss_fn(reconstruction, broken_double_images) 
+                
             kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) + kl_loss_fn(broken_z_mu, broken_z_sigma) )
 
             B, C, H, W = reconstruction.shape
@@ -635,9 +643,14 @@ if __name__ == '__main__':
             recon_dce1 = reconstruction[:, 0:1].repeat(1,3,1,1)
             recon_dce2 = reconstruction[:, 1:2].repeat(1,3,1,1)
             recon_dce3 = reconstruction[:, 2:3].repeat(1,3,1,1)
-            image_dce1 = double_images[:, 0:1].repeat(1,3,1,1)
-            image_dce2 = double_images[:, 1:2].repeat(1,3,1,1)
-            image_dce3 = double_images[:, 2:3].repeat(1,3,1,1)
+            if not use_mask_loss:
+                image_dce1 = double_images[:, 0:1].repeat(1,3,1,1)
+                image_dce2 = double_images[:, 1:2].repeat(1,3,1,1)
+                image_dce3 = double_images[:, 2:3].repeat(1,3,1,1)
+            else:
+                image_dce1 = broken_double_images[:, 0:1].repeat(1,3,1,1)
+                image_dce2 = broken_double_images[:, 1:2].repeat(1,3,1,1)
+                image_dce3 = broken_double_images[:, 2:3].repeat(1,3,1,1)
 
             # Duplicate each channel 3× → [B,3,H,W]
 
@@ -760,9 +773,9 @@ if __name__ == '__main__':
 
             # ⚠️ This is a workaround, but should be improved
             if use_adv:
-                with accelerator.autocast():
-                    fake_images = reconstruction.detach()  # Detach to cut generator graph
-                    logits_real = discriminator(images.contiguous())[-1]   # .contiguous().detach()
+                # with accelerator.autocast():
+                fake_images = reconstruction.detach()  # Detach to cut generator graph
+                logits_real = discriminator(images.contiguous())[-1]   # .contiguous().detach()
                 d_loss_real = adv_loss_fn(logits_real, target_is_real=True, for_discriminator=True)
 
                 discriminator_loss = (d_loss_real) * 0.5
@@ -773,9 +786,9 @@ if __name__ == '__main__':
 
                 del logits_real, loss_d
           
-                with accelerator.autocast():
-                    fake_images = reconstruction.detach()  # Detach to cut generator graph
-                    logits_fake = discriminator(fake_images.contiguous())[-1]
+                # with accelerator.autocast():
+                fake_images = reconstruction.detach()  # Detach to cut generator graph
+                logits_fake = discriminator(fake_images.contiguous())[-1]
 
                 d_loss_fake = adv_loss_fn(logits_fake, target_is_real=False, for_discriminator=True)
 

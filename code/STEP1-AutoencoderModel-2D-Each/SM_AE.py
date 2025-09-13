@@ -41,8 +41,8 @@ def max_abs_fusion(mu_list, logvar_list):
 # Utility: Mixture-of-Experts fusion
 # ------------------------------
 def moe(mu_list, logvar_list):
-    var_list = [torch.exp(lv) for lv in logvar_list]
-    mu_stack = torch.stack(mu_list)
+    var_list  = [torch.exp(lv) for lv in logvar_list]
+    mu_stack  = torch.stack(mu_list)
     var_stack = torch.stack(var_list)
 
     # Uniform weights
@@ -65,20 +65,20 @@ def moe(mu_list, logvar_list):
 
 
 
-class AutoencoderKL_multi_encoder(AutoencoderKL):
+class AutoencoderKL_single_encoder(AutoencoderKL):
     def __init__(self, num_encode=1, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
         self.num_encode = num_encode
 
         # Duplicate encoders
-        self.encoders = nn.ModuleList([self._build_encoder_copy() for _ in range(num_encode)])
-        self.quant_convs = nn.ModuleList(
-            [self._build_conv_copy(self.quant_conv) for _ in range(num_encode)]
-        )
-        self.post_quant_convs = nn.ModuleList(
-            [self._build_conv_copy(self.post_quant_conv) for _ in range(num_encode)]
-        )
+        # self.encoders    = nn.ModuleList([self._build_encoder_copy() for _ in range(num_encode)])
+        # self.quant_convs = nn.ModuleList(
+        #     [self._build_conv_copy(self.quant_conv) for _ in range(num_encode)]
+        # )
+        # self.post_quant_convs = nn.ModuleList(
+        #     [self._build_conv_copy(self.post_quant_conv) for _ in range(num_encode)]
+        # )
 
 
     def _build_encoder_copy(self):
@@ -99,9 +99,9 @@ class AutoencoderKL_multi_encoder(AutoencoderKL):
         if self.use_tiling and (width > self.tile_sample_min_size or height > self.tile_sample_min_size):
             return self._tiled_encode(x)
 
-        enc = self.encoders[encoder_id](x)
+        enc = self.encoder(x)  # s[encoder_id]
 
-        quant_conv = self.quant_convs[encoder_id]
+        quant_conv = self.quant_conv  # s[encoder_id]
         if quant_conv is not None:
             enc = quant_conv(enc)
 
@@ -149,8 +149,8 @@ class AutoencoderKL_multi_encoder(AutoencoderKL):
             mu = torch.zeros(batch, self.latent_dim, device=device)
             logvar = torch.zeros_like(mu)
         else:
-            # mu, logvar = poe(mu_list, logvar_list)
-            mu, logvar = max_abs_fusion(mu_list, logvar_list)
+            mu, logvar = poe(mu_list, logvar_list)
+            # mu, logvar = max_abs_fusion(mu_list, logvar_list)
 
         new_params = torch.cat([mu, logvar], dim=1)
         fused_posterior = DiagonalGaussianDistribution(new_params)

@@ -65,6 +65,61 @@ from monai.networks.schedulers.ddim import DDIMPredictionType
 
 import torch
 
+
+class EMA:
+    def __init__(self, model, beta=0.9999, update_after_step=100, update_every=1):
+        """
+        model: torch.nn.Module
+        beta: decay rate (closer to 1 → slower update, smoother EMA)
+        update_after_step: start EMA updates only after this many steps
+        update_every: update EMA every N steps
+        """
+        self.beta = beta
+        self.update_after_step = update_after_step
+        self.update_every = update_every
+        self.step = 0
+
+        # Create a copy of the model for EMA
+        self.ema_model = deepcopy(model)
+        self.ema_model.eval()
+        for p in self.ema_model.parameters():
+            p.requires_grad = False
+
+    def update(self, model):
+        self.step += 1
+        if self.step < self.update_after_step:
+            # keep ema weights the same before warmup
+            self._copy_params(model)
+            return
+        if self.step % self.update_every != 0:
+            return
+
+        with torch.no_grad():
+            msd = model.state_dict()
+            msd = remove_module_prefix(model.state_dict())
+
+            for k, ema_v in self.ema_model.state_dict().items():
+                model_v = msd[k].detach()
+                if not model_v.dtype.is_floating_point:
+                    ema_v.copy_(model_v)  # buffers (int, bool etc.)
+                else:
+                    ema_v.mul_(self.beta).add_(model_v, alpha=1 - self.beta)
+
+    def _copy_params(self, model):
+        """copy params from model → ema_model (for init/warmup)"""
+        w = remove_module_prefix(model.state_dict())
+        self.ema_model.load_state_dict(w)
+
+    def state_dict(self):
+        return remove_module_prefix(self.ema_model.state_dict())
+
+    def to(self, device):
+        self.ema_model.to(device)
+        return self
+
+
+
+
 class TimeScheduler:
     def __init__(self, device=DEVICE, sigma_min=0.05, sigma_max=1.0):
         """
@@ -130,7 +185,7 @@ def sample_using_diffusion(
         device: str,
         scale_factor: int = 1,
         num_training_steps: int = 1000,
-        num_inference_steps: int = 50,
+        num_inference_steps: int = 20,
         schedule: str = 'scaled_linear_beta',
         beta_start: float = 0.0015,
         beta_end: float = 0.0205,
@@ -147,6 +202,7 @@ def sample_using_diffusion(
     z = x0.clone()
 
     # Linear
+    #
     t_steps = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device)
     # dt = t_steps[1] - t_steps[0]
 
@@ -456,7 +512,7 @@ def images_to_tensorboard(
             diffusion=diffusion,
             x0=x0, #inputs_latents,
             x1=x1,
-            num_inference_steps=100,
+            num_inference_steps=200,
             device=DEVICE,
             scale_factor=scale_factor,
             epoch=epoch
@@ -480,11 +536,11 @@ def images_to_tensorboard(
     modality_names = [m.upper() for m in modality_names]
 
     if use_standard_norm:
-        ct_mean = ct_mean.cpu().numpy()
-        ct_std  = ct_std.cpu().numpy()
-        recon_np     = denormalize(recon_np, ct_mean, ct_std) #.cpu().numpy()
-        recon_broken = denormalize(recon_broken, ct_mean, ct_std)#.cpu().numpy()
-        image_np     = denormalize(image_np, ct_mean, ct_std)#.cpu().numpy
+        ctc_mean = ctc_mean.cpu().numpy()
+        ctc_std  = ctc_std.cpu().numpy()
+        recon_np     = denormalize(recon_np, ctc_mean, ctc_std) #.cpu().numpy()
+        recon_broken = denormalize(recon_broken, ctc_mean, ctc_std)#.cpu().numpy()
+        image_np     = denormalize(image_np, ctc_mean, ctc_std)#.cpu().numpy
 
     # print("image_np[b] =", image_np[b].shape, recon_broken[b].shape, recon_np[b].shape, context_np[b].shape)
     stack_and_save(image_np, recon_broken, recon_np, save_root, epoch, modality_names)
@@ -566,7 +622,9 @@ def images_to_tensorboard(
 
 
 
-from src.MM_AE import AutoencoderKL_multi_encoder
+# from src.MM_AE import AutoencoderKL_multi_encoder
+
+from SM_AE import AutoencoderKL_single_encoder
 
 def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
     from huggingface_hub import snapshot_download
@@ -583,7 +641,7 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
 
     n_blocks = len(block_out_channels)
 
-    vae = AutoencoderKL_multi_encoder(
+    vae = AutoencoderKL_single_encoder(
         num_encode = in_channels,
         in_channels=1, out_channels=out_channels, latent_channels=latent_channels,
         block_out_channels=block_out_channels, 
@@ -689,6 +747,10 @@ if __name__ == '__main__':
 
     diffusion = networks.init_latent_diffusion(args, in_channels=16, use_image=False, spatial_dims=dimension).to(DEVICE)
 
+
+    ema_diffusion = EMA(diffusion)
+
+
     if args.diff_ckpt:
         print("Loading diffusion checkpoint:", args.diff_ckpt)
         weight = torch.load(args.diff_ckpt, map_location=DEVICE)
@@ -726,13 +788,32 @@ if __name__ == '__main__':
     print(f"Scaling factor set to {scale_factor}")
 
     from monai.losses import PerceptualLoss
+    use_adv           = True  # NAN
+    adv_weight        = 0.025
+    perceptual_weight = 0.1     # if  args.use_broken else 0.0  # 0.1  
+    kl_weight         = 1e-7  # 1e-7
     perc_loss_fn = PerceptualLoss(spatial_dims=dimension,
                                       network_type="squeeze",
                                       is_fake_3d=True if dimension == 3 else False).to(DEVICE)
 
-                                      
-    autoencoder, optimizer, train_loader, diffusion, scheduler_g, autoencoder.encode, autoencoder.decode, perc_loss_fn = accelerator.prepare(
-        autoencoder, optimizer, train_loader, diffusion, scheduler_g, autoencoder.encode, autoencoder.decode, perc_loss_fn
+    from monai.losses import PerceptualLoss, PatchAdversarialLoss
+    from src import init_patch_discriminator # KLDivergenceLoss
+
+    # kl_loss_fn  = KLDivergenceLoss()
+    adv_loss_fn = PatchAdversarialLoss(criterion="least_squares")  # criterion="hinge"
+
+    discriminator = init_patch_discriminator(args.disc_ckpt, 
+                                             spatial_dims=dimension,
+                                             in_channels=16, 
+                                             num_layers_d=3).to(DEVICE)
+ 
+
+    optimizer_d = torch.optim.AdamW(discriminator.parameters(), lr=args.lr * 0.1, weight_decay=1e-6)  # AdamW
+
+    
+
+    autoencoder, optimizer, train_loader, diffusion, scheduler_g, autoencoder.encode, autoencoder.decode, perc_loss_fn, ema_diffusion, adv_loss_fn, discriminator = accelerator.prepare(
+        autoencoder, optimizer, train_loader, diffusion, scheduler_g, autoencoder.encode, autoencoder.decode, perc_loss_fn, ema_diffusion, adv_loss_fn, discriminator
     )
 
     # writer   = SummaryWriter()
@@ -754,6 +835,10 @@ if __name__ == '__main__':
             loader = loaders[mode]
             diffusion.train() if mode == 'train' else diffusion.eval()
             epoch_loss = 0
+            mse_loss_total = 0.0
+            rec_loss_total = 0.0
+            gen_loss_total = 0.0
+            ae_loss_total  = 0.0
             progress_bar = tqdm(enumerate(loader), total=len(loader))
             progress_bar.set_description(f"{mode.upper()} Epoch {epoch}")
 
@@ -771,13 +856,10 @@ if __name__ == '__main__':
 
                     # Use to be  context: context tensor (N, 1, ContextDim).
                     B         = batch[latent_key].shape[0]
-
                     t         = torch.rand(B, device=DEVICE)  # log-uniform?
                     # t = torch.sigmoid(torch.randn(B, device=DEVICE))
                     
                     # t = t_schedule.sample_train_t(batch_size=B, method="beta")
-                    # print("t = ", t)
-
 
                     x0        = batch[broken_latent_key].to(DEVICE).clone() * scale_factor[0]
                     x1        = batch[latent_key].to(DEVICE).clone() * scale_factor[1]
@@ -787,39 +869,90 @@ if __name__ == '__main__':
 
 
                     # x0 -> x1
-                    sigma = 0.0 # 1.0
+                    sigma = 0.05 # 1.0
                     xt, eps, sigma_t = compute_xt(x0, x1, t, sigma_min=sigma)
                     ut = compute_ut(x0, x1, t, eps, sigma_t, sigma_min=sigma)
 
                     # x_t = (1 - t_img) * x_0 + t_img * x_1         # [B, 1, H, W]
                     # ut = x_1 - x_0                              # [B, 1, H, W]
-
-
-                    
+                   
                     pred = diffusion(xt, t) #x=xt, timesteps=t, context=None)
 
+                    mse_loss = F.mse_loss(pred, ut)  # MSE Loss
+                    x1_pred = x0 + pred
 
-                    # if epoch < 10:
-                        # loss = F.mse_loss(pred, ut)  # MSE Loss
-                    # else:
+                    import torch
+                    def flatten_latent(z):
+                        """
+                        z: latent tensor of shape (B, C, H, W) or (B, C, H, W, D)
+                        returns: (B, C*H*W*D)
+                        """
+                        return z.view(z.size(0), -1)
 
-                    loss = charbonnier_smooth_l1_loss(pred, ut)
 
-                    if epoch > 10:
-                        x1_pred = x0 + pred
-                        recon = ae.decode((x1_pred / scale_factor[1])).sample
-                        recon = recon[:, 1:2, :, :] #.unsqueeze(1)  # only CTC channel
-                        loss += 0.1 * F.l1_loss(recon, ctc_norm)
+                    def compute_mmd(x, y, sigma=1.0):
+                        """
+                        Compute MMD between two sets of latents
+                        x: (B, C, H, W, ...)  -> will be flattened
+                        y: (B, C, H, W, ...)  -> will be flattened
+                        """
+                        x = flatten_latent(x)
+                        y = flatten_latent(y)
 
-                if epoch > 10:
-                    reconstruction_3ch = torch.cat([recon] * 3, dim=1)  # [B, C, H, W]
-                    images_3ch         = torch.cat([ctc_norm] * 3, dim=1)
+                        xx, yy, xy = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
+                        
+                        rx = xx.diag().unsqueeze(0).expand_as(xx)
+                        ry = yy.diag().unsqueeze(0).expand_as(yy)
+
+                        dxx = rx.t() + rx - 2*xx
+                        dyy = ry.t() + ry - 2*yy
+                        dxy = rx.t() + ry - 2*xy
+
+                        kxx = torch.exp(-dxx / (2*sigma**2))
+                        kyy = torch.exp(-dyy / (2*sigma**2))
+                        kxy = torch.exp(-dxy / (2*sigma**2))
+
+                        return kxx.mean() + kyy.mean() - 2*kxy.mean()
+
+
+
+                    rec_loss = 0.1 * compute_mmd(x1_pred, x1)
+                    # loss_mmd = compute_mmd(z1_to_2, z2)
+
+                    loss = mse_loss + rec_loss
+                    
+                    # adv_loss_fn
+                if use_adv:
+                    logits_fake = discriminator(x1_pred.contiguous())[-1]
+                    gen_loss = adv_weight * adv_loss_fn(logits_fake, 
+                                                        target_is_real=True, 
+                                                        for_discriminator=False)
+                    loss += gen_loss
+                else:
+                    gen_loss = torch.tensor(0.0)
+
+                   
+
+                recon = ae.decode((x1_pred / scale_factor[1])).sample
+                recon = recon[:, 1:2, :, :] #.unsqueeze(1)  # only CTC channel
+                ae_loss = F.l1_loss(recon, ctc_norm)  # 0.1
+                loss += ae_loss
+
+                    # kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) )
+
+                #     if epoch > 10:
+                #         
+                        
+
+                # if epoch > 10:
+                #     reconstruction_3ch = torch.cat([recon] * 3, dim=1)  # [B, C, H, W]
+                #     images_3ch         = torch.cat([ctc_norm] * 3, dim=1)
                     
                     
-                    loss += 0.1 *  perc_loss_fn(
-                        reconstruction_3ch.float(),
-                        images_3ch.float().detach()
-                    )
+                #     loss += 0.1 *  perc_loss_fn(
+                #         reconstruction_3ch.float(),
+                #         images_3ch.float().detach()
+                #     )
 
 
                     # cos_loss = 1 - F.cosine_similarity(pred, ut, dim=1).mean()
@@ -830,24 +963,62 @@ if __name__ == '__main__':
 
                 if mode == 'train':
                     # Accumulated Loss
-                    loss = loss / gradient_accumulation_steps  # normalize loss
-                    accelerator.backward(loss)
+                    loss_acc = loss / gradient_accumulation_steps  # normalize loss
+                    accelerator.backward(loss_acc)
 
                     if (step + 1) % gradient_accumulation_steps == 0 or (step + 1 == len(loader)):
                         optimizer.step()
-                        optimizer.zero_grad()
                         scheduler_g.step() 
-
+                        ema_diffusion.update(diffusion)  
 
                 epoch_loss += loss.item()
+                mse_loss_total += mse_loss.item()
+                rec_loss_total += rec_loss.item()
+                gen_loss_total += gen_loss.item()
+                ae_loss_total  += ae_loss.item()
 
                 progress_bar.set_postfix({
                     "Step": step,
                     "Loss": epoch_loss / (step + 1),
+                    "MSE":  mse_loss_total / (step + 1),
+                    "Rec":  rec_loss_total / (step + 1),
+                    "Gen":  gen_loss_total / (step + 1),
+                    "AE":   ae_loss_total / (step + 1),
                     # "Percept": perceptual_loss.item(),
                 })
 
                 global_counter[mode] += 1
+
+
+                 # ADV Loss
+                if use_adv:
+                    optimizer_d.zero_grad()
+                    # with accelerator.autocast():
+                    fake_images = x1_pred.detach()  # Detach to cut generator graph
+                    logits_real = discriminator(x1.contiguous())[-1]   # .contiguous().detach()
+                    d_loss_real = adv_loss_fn(logits_real, target_is_real=True, for_discriminator=True)
+
+                    discriminator_loss = (d_loss_real) * 0.5
+                    loss_d = discriminator_loss
+
+                    optimizer_d.zero_grad()
+                    accelerator.backward(loss_d)
+
+                    del logits_real, loss_d
+                
+                    # with accelerator.autocast():
+                    fake_images = x1_pred.detach()  # Detach to cut generator graph
+                    logits_fake = discriminator(fake_images.contiguous())[-1]
+
+                    d_loss_fake = adv_loss_fn(logits_fake, target_is_real=False, for_discriminator=True)
+
+                    discriminator_loss = (d_loss_fake) * 0.5
+                    loss_d1 = discriminator_loss
+
+                    accelerator.backward(loss_d1)
+                    optimizer_d.step()
+                    optimizer_d.zero_grad()
+
 
             # end of epoch
             epoch_loss = epoch_loss / len(loader)
@@ -856,17 +1027,20 @@ if __name__ == '__main__':
 
             accelerator.wait_for_everyone()
             # visualize results
+            
             if accelerator.is_main_process:
+                # ema_diffusion.apply_shadow() 
                 images_to_tensorboard(
                     batch=batch,
                     writer=None,
                     epoch=epoch,
                     mode=mode,
                     autoencoder=autoencoder,
-                    diffusion=diffusion,
+                    diffusion=ema_diffusion.ema_model if  epoch % 2 == 0 else diffusion,
                     scale_factor=scale_factor,
                     modality_names=image_key
                 )
+                # ema_diffusion.restore()
 
         # save the model                
         savepath = os.path.join(args.output_dir, f'dm-unet-ep-{epoch}-{image_key_str}.pth')
