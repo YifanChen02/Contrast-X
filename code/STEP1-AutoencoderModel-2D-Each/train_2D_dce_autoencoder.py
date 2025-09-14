@@ -560,23 +560,50 @@ if __name__ == '__main__':
             clean_inputs           = [dce1, dce2, dce3]
             clean_modalities_mask  = [True, True, True]
 
+            import random
+            def random_drop_modalities(inputs, device):
+                """
+                inputs: list of [dce1, dce2, dce3]
+                device: torch device
+                """
+                n_drop = random.choice([1, 2])  # randomly decide to drop 1 or 2
+                drop_indices = random.sample(range(len(inputs)), n_drop)
 
-            r = np.random.rand()
-            
-            broken_inputs = [dce1]
-            broken_modalities_mask   = [True]
+                broken_inputs = []
+                broken_modalities_mask = []
 
-            # Randomly drop dce2 and dce3
-            for dce in [dce2, dce3]:
-                if np.random.rand() < 0.5:  # 50% chance to keep
-                    r = torch.rand(1).item()  # get a single random scalar
-                    dce = dce * r + (1 - r) * dce1
-                    dce = dce.detach()
-                    broken_inputs.append(dce)
-                    broken_modalities_mask.append(True)
-                else:
-                    broken_inputs.append(torch.zeros_like(dce).to(DEVICE))
-                    broken_modalities_mask.append(False)
+                for i, dce in enumerate(inputs):
+                    if i in drop_indices:
+                        broken_inputs.append(torch.zeros_like(dce).to(device))
+                        broken_modalities_mask.append(False)
+                    else:
+                        broken_inputs.append(dce)
+                        broken_modalities_mask.append(True)
+
+                return broken_inputs, broken_modalities_mask
+
+            # Example usage
+            inputs = [dce1, dce2, dce3]
+            broken_inputs, broken_modalities_mask = random_drop_modalities(inputs, DEVICE)
+
+
+            # broken_inputs = [dce1]
+            # broken_modalities_mask   = [True]
+
+            # # Randomly drop dce2 and dce3
+            # for dce in [dce2, dce3]:
+            #     if np.random.rand() < 0.5:  # 50% chance to keep
+            #         # r = torch.rand(1).item()  # get a single random scalar
+            #         # dce = dce * r + (1 - r) * dce1
+            #         # dce = dce.detach()
+            #         dce = 
+            #         broken_inputs.append(dce)
+            #         broken_modalities_mask.append(True)
+            #     else:
+            #         broken_inputs.append(torch.zeros_like(dce).to(DEVICE))
+            #         broken_modalities_mask.append(False)
+
+
 
             broken_double_images    = torch.cat([images, torch.cat(broken_inputs, dim=1)], dim=0)
             broken_double_images    = broken_double_images.detach()

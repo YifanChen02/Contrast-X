@@ -537,32 +537,33 @@ if __name__ == '__main__':
             clean_modalities_mask  = [True, True]
 
 
-            r = np.random.rand()
+            # r = np.random.rand()
             
             broken_inputs = [ct, ctc]
             broken_modalities_mask   = [True, True]
         
-
-            # r = torch.rand(1).item()
+            B = ct.shape[0]
+            r = torch.rand((B,1)).item()
 
             if np.random.rand() < 0.5:  # 50% chance to keep
-                # ctc_mix = ctc * r + (1 - r) * ct  # Mix
-                # ctc_mix = ctc_mix.detach()
+                ctc_mix = ctc * r + (1 - r) * ct  # Mix
+                ct_mix  = ct  * r + (1 - r) * ctc 
 
-                ctc_mix = ct.detach()
+                ctc_mix = ctc_mix.detach()
+                ct_mix  = ct_mix.detach()
+
                 broken_inputs = [ct, ctc_mix]
                 
                 # if np.random.rand() < 0.5:
-                broken_modalities_mask   = [True, False]
+                broken_modalities_mask   = [True, True]
                 
             else:
-                # ct_mix = ct * r + (1 - r) * ctc
-                # ct_mix = ct_mix.detach()
+                
                 ct_mix = ctc.detach()   
-                broken_inputs = [ct_mix, ctc]
+                broken_inputs = [ct, ctc]
                 
                 # if np.random.rand() < 0.5:
-                broken_modalities_mask   = [False, True]
+                broken_modalities_mask   = [True, False]
 
             broken_double_images    = torch.cat([images, torch.cat(broken_inputs, dim=1)], dim=0)
             broken_double_images    = broken_double_images.detach()
