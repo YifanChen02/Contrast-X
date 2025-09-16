@@ -231,3 +231,130 @@ class AutoencoderKL_single_encoder(AutoencoderKL):
             return (dec,)
 
         return DecoderOutput(sample=dec)
+
+
+
+class AutoencoderKL_multi_decoder(AutoencoderKL):
+    def __init__(self, num_decoders=2, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_decoders = num_decoders
+
+        # Duplicate decoders + post_quant_conv for each head
+        import copy
+        self.decoders = nn.ModuleList([copy.deepcopy(self.decoder) for _ in range(num_decoders)])
+        self.post_quant_convs = nn.ModuleList(
+            [copy.deepcopy(self.post_quant_conv) for _ in range(num_decoders)]
+        )
+
+
+        
+    def _encode(self, x: torch.Tensor, encoder_id: int = 0) -> torch.Tensor:
+        batch_size, num_channels, height, width = x.shape
+
+        if self.use_tiling and (width > self.tile_sample_min_size or height > self.tile_sample_min_size):
+            return self._tiled_encode(x)
+
+        enc = self.encoder(x)  # s[encoder_id]
+
+        quant_conv = self.quant_conv  # s[encoder_id]
+        if quant_conv is not None:
+            enc = quant_conv(enc)
+
+        return enc
+
+    @apply_forward_hook
+    def encode(self, x: torch.Tensor, encoder_id: int = 0, return_dict: bool = True):
+        """
+        Encode using one encoder (like vanilla AutoencoderKL).
+        """
+        if encoder_id >= self.num_encode:
+            raise ValueError(f"encoder_id {encoder_id} out of range (num_encode={self.num_encode})")
+
+        if self.use_slicing and x.shape[0] > 1:
+            encoded_slices = [self._encode(x_slice, encoder_id) for x_slice in x.split(1)]
+            h = torch.cat(encoded_slices)
+        else:
+            h = self._encode(x, encoder_id)
+
+        posterior = DiagonalGaussianDistribution(h)
+
+        if not return_dict:
+            return (posterior,)
+        return AutoencoderKLOutput(latent_dist=posterior)
+
+    # ------------------------------
+    # Multi-encoder fusion with PoE
+    # ------------------------------
+    def encode_multi(self, inputs, mask, return_dict=True):
+        """
+        inputs: list of modality tensors
+        mask: list of booleans (True if modality present)
+        """
+        mu_list, logvar_list = [], []
+        for i, present in enumerate(mask):
+            if present:
+                h = self._encode(inputs[i], encoder_id=i)
+                posterior = DiagonalGaussianDistribution(h)
+                mu_list.append(posterior.mean)
+                logvar_list.append(posterior.logvar)
+
+        if len(mu_list) == 0:
+            batch = inputs[0].shape[0]
+            device = inputs[0].device
+            mu = torch.zeros(batch, self.latent_dim, device=device)
+            logvar = torch.zeros_like(mu)
+        else:
+            mu, logvar = poe(mu_list, logvar_list)
+            # mu, logvar = max_abs_fusion(mu_list, logvar_list)
+
+        new_params = torch.cat([mu, logvar], dim=1)
+        fused_posterior = DiagonalGaussianDistribution(new_params)
+
+        # DiagonalGaussianDistribution.from_mean_logvar(mu, logvar)
+
+        if not return_dict:
+            return (fused_posterior,)
+        return AutoencoderKLOutput(latent_dist=fused_posterior)
+
+
+
+    def _decode_with(self, z, decoder_id=0):
+        # Apply corresponding post_quant_conv + decoder
+        dec = self.post_quant_convs[decoder_id](z)
+        dec = self.decoders[decoder_id](dec)
+        return dec
+
+    @apply_forward_hook
+    def decode(self, z, decoder_id=0, all_decoders=False, return_dict=True):
+        """
+        Decode using one decoder, or all decoders if all_decoders=True.
+        """
+        if all_decoders:
+            outs = [self._decode_with(z, i) for i in range(self.num_decoders)]
+            if return_dict:
+                return [DecoderOutput(sample=o) for o in outs]
+            return outs
+        else:
+            if decoder_id >= self.num_decoders:
+                raise ValueError(f"decoder_id {decoder_id} out of range (num_decoders={self.num_decoders})")
+            out = self._decode_with(z, decoder_id)
+            if return_dict:
+                return DecoderOutput(sample=out)
+            return (out,)
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        sample_posterior: bool = False,
+        return_dict: bool = True,
+        generator=None,
+        decoder_id: int = 0,
+        all_decoders: bool = False,
+    ):
+        # Encode with the shared encoder
+        posterior = self.encode(sample, return_dict=True).latent_dist
+
+        z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
+
+        # Decode with one or many decoders
+        return self.decode(z, decoder_id=decoder_id, all_decoders=all_decoders, return_dict=return_dict)

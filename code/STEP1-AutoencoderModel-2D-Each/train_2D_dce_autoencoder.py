@@ -51,7 +51,7 @@ DEVICE = accelerator.device
 valid_ratio = 0  # All mask
 train_ratio = 0  # 0.5  # Half mask
 
-use_standard_norm = True # use_standard_norm
+use_standard_norm = args.use_standard_norm
 use_broken        = args.use_broken  # True
 
 ACTIVATION_CLASSES = (nn.ReLU, nn.LeakyReLU, nn.ELU, nn.PReLU, nn.RReLU)
@@ -351,7 +351,8 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
 
     n_blocks = len(block_out_channels)
 
-    vae = AutoencoderKL_single_encoder(
+    vae = AutoencoderKL_multi_encoder(
+    # vae = AutoencoderKL_single_encoder(
         num_encode = in_channels,
         in_channels=1, out_channels=out_channels, latent_channels=latent_channels,
         block_out_channels=block_out_channels, 
@@ -365,6 +366,28 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
 
     return vae
 
+def sample_lambda(alpha=0.4, batch_size=1, device="cuda"):
+    """Sample lambda from Beta distribution"""
+    lam = np.random.beta(alpha, alpha, size=batch_size)
+    lam = torch.tensor(lam, dtype=torch.float32, device=device)
+    return lam.view(-1, 1, 1, 1)  # reshape for broadcasting
+
+# Example inside training loop
+def latent_mixup(z_clean, z_broken, alpha=0.5):
+    """
+    x_full: input with all modalities
+    x_partial: input with missing modalities
+    target_modalities: ground-truth full modalities (reconstruction target)
+    """
+    # Encode both
+
+    # Sample lambda for each item in batch
+    lam = sample_lambda(alpha=alpha, batch_size=z_clean.size(0), device=z_clean.device)
+
+    # Mix latents
+    z_mix = lam * z_broken + (1 - lam) * z_clean
+
+    return z_mix
 
 
 
@@ -385,6 +408,8 @@ if __name__ == '__main__':
     if message != "":
         image_key_str += f"-{message}"
 
+    if not use_standard_norm:
+        image_key_str += "-minmax"
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -555,7 +580,7 @@ if __name__ == '__main__':
                 dce3, dce3_mean, dce3_std    = standard_normalize(dce3)
 
             images           = torch.cat([dce1, dce2, dce3], dim=1)
-            double_images    = torch.cat([images, images], dim=0)
+            double_images    = torch.cat([images, images, images], dim=0)
 
             clean_inputs           = [dce1, dce2, dce3]
             clean_modalities_mask  = [True, True, True]
@@ -586,25 +611,6 @@ if __name__ == '__main__':
             inputs = [dce1, dce2, dce3]
             broken_inputs, broken_modalities_mask = random_drop_modalities(inputs, DEVICE)
 
-
-            # broken_inputs = [dce1]
-            # broken_modalities_mask   = [True]
-
-            # # Randomly drop dce2 and dce3
-            # for dce in [dce2, dce3]:
-            #     if np.random.rand() < 0.5:  # 50% chance to keep
-            #         # r = torch.rand(1).item()  # get a single random scalar
-            #         # dce = dce * r + (1 - r) * dce1
-            #         # dce = dce.detach()
-            #         dce = 
-            #         broken_inputs.append(dce)
-            #         broken_modalities_mask.append(True)
-            #     else:
-            #         broken_inputs.append(torch.zeros_like(dce).to(DEVICE))
-            #         broken_modalities_mask.append(False)
-
-
-
             broken_double_images    = torch.cat([images, torch.cat(broken_inputs, dim=1)], dim=0)
             broken_double_images    = broken_double_images.detach()
             
@@ -622,8 +628,8 @@ if __name__ == '__main__':
 
                 enc_out = autoencoder.encode_multi(broken_inputs, broken_modalities_mask)       # EncodeOutput, (self, inputs, mask, return_dict=True):
                 broken_z_dist  = enc_out.latent_dist                # Normal distribution
-                broken_z_mu    = z_dist.mean
-                broken_z_sigma = z_dist.std
+                broken_z_mu    = broken_z_dist.mean
+                broken_z_sigma = broken_z_dist.std
 
 
                 use_sample_training = True   #False
@@ -637,13 +643,17 @@ if __name__ == '__main__':
                     b_z     = broken_z_mu
 
                 # Decode
+                z_mix = latent_mixup(z, b_z)
+                dec_out = autoencoder.decode(z)              # DecoderOutput
+                mix_reconstruction = dec_out.sample
+
                 dec_out = autoencoder.decode(z)              # DecoderOutput
                 reconstruction = dec_out.sample
 
                 dec_out = autoencoder.decode(b_z)              # DecoderOutput
                 broken_reconstruction = dec_out.sample
 
-                reconstruction = torch.cat([reconstruction, broken_reconstruction], dim=0)
+                reconstruction = torch.cat([reconstruction, broken_reconstruction, mix_reconstruction], dim=0)
 
             gen_loss = torch.tensor(0).to(reconstruction.device)
             # with accelerator.autocast():
@@ -742,11 +752,11 @@ if __name__ == '__main__':
                                        z_mu.detach().float(), 
                                        z_sigma.detach().float()) + F.mse_loss(broken_z_mu, z_mu.detach())
             
-            loss_latent = 0.1 * loss_latent
+            loss_latent = 0.01 * loss_latent
           
 
 
-            loss_g = rec_loss + kld_loss + gen_loss + per_loss + loss_latent
+            loss_g = rec_loss + kld_loss + gen_loss + per_loss # + loss_latent
 
             progress_bar.set_postfix(loss_g=loss_g.item()      if hasattr(loss_g, "item") else loss_g,
                                         latent=loss_latent.item() if hasattr(loss_latent, "item") else loss_latent,

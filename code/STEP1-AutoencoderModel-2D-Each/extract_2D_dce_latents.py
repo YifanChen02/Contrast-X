@@ -237,10 +237,10 @@ if __name__ == '__main__':
                 out_dir = OUT_ROOT / rel_dir
                 out_dir.mkdir(parents=True, exist_ok=True)
 
-                destpath = out_dir / 'DCE_Full.npz'
+                destpath = out_dir / 'DCE_123.npz'
                 np.savez_compressed(destpath, data=latent)
 
-                # print("destpath:", destpath)
+
 
 
             # ct           = batch['CT'].to(DEVICE)

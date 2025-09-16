@@ -13,8 +13,8 @@ temp=/date/hao/FM
 
 # -------------------- Train 2DAE -----------------------
 cd /home/hao/repo/FM-translation/code/STEP1-AutoencoderModel-2D-Each
-gpu=1,2,3,4
 gpu=5,6,7
+
 data_files=../data/files/2D_CT_pair.csv
 aekl_ckpt=/date/hao/FM/checkpoint/CT/AE/ae-127-CT-CTC.pth
 
@@ -27,7 +27,16 @@ CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 -
       --batch_size 12  --n_epochs  200    --lr 3e-4 \
       --cache_dir  ${temp}/cache/CT_all     \
       --input_modality   CT CTC    --missing_modality   CTC  \
-      --output_dir  $output_dir  --resume 45
+      --output_dir  $output_dir  
+
+CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 --main_process_port 19360 \
+      train_2D_ct_autoencoder_mix.py --gpu $gpu  \
+      --dataset_csv $data_files   --task  $task \
+      --batch_size 12  --n_epochs  200    --lr 3e-4 \
+      --cache_dir  ${temp}/cache/CT_all     \
+      --input_modality   CT CTC    --missing_modality   CTC  \
+      --output_dir  $output_dir  
+
 
 
 
@@ -62,6 +71,8 @@ CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 -
 
 
   
+
+
 
 
 
@@ -105,8 +116,46 @@ CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 -
 
 
 # -------------------- Train Flow Matching -----------------------
-gpu=4,5,6,7
-cd ../STEP2-FlowMatching
+gpu=7
+
+
+
+cd /home/hao/repo/FM-translation/code/STEP1-AutoencoderModel-2D-Each/../STEP2-FlowMatching
+task=CT 
+latent_dir=/date/hao/FM/latent/CT-CTC/2D
+data_dir=/date/hao/PairedContrast/CT/low_256x256_2Dimension
+output_dir=/date/hao/FM/latent/CT-CTC/2D
+aekl_ckpt=/date/hao/FM/checkpoint/CT/2D_AE_smaller/ae-62-CT-CTC.pth
+data_files=../data/files/2D_CT_pair.csv
+temp=/date/hao/FM
+
+fm_ckpt=/date/hao/FM/latent/CT-CTC/2D/dm-unet-ep-15-CT-CTC-Adrenal.pth
+
+
+CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --main_process_port 15350  \
+        train_ct_2D_flowmatching.py   \
+        --batch_size   2  \
+        --dataset_csv $data_files   --task  $task \
+        --gpu  $gpu      --input_modality   CT CTC    \
+        --lr    3e-5     \
+        --n_epochs  500  \
+        --grad_accum_steps 1  \
+        --latent_dir $latent_dir  \
+        --cache_dir ${temp}/cache/CT_all   \
+        --output_dir $output_dir \
+        --aekl_ckpt  $aekl_ckpt   \
+        --data_dir   $data_dir      --DEBUG
+
+
+        --diff_ckpt $fm_ckpt   \
+
+
+
+
+
+
+gpu=6,7
+cd /home/hao/repo/FM-translation/code/STEP1-AutoencoderModel-3D/../STEP2-FlowMatching
 
 task=CT 
 latent_dir=/date/hao/FM/latent/CT-CTC/2D
@@ -119,24 +168,26 @@ temp=/date/hao/FM
 fm_ckpt=/date/hao/FM/latent/CT-CTC/2D/dm-unet-ep-15-CT-CTC-Adrenal.pth
 
 # 2.5e-5
+# --mixed_precision fp16 
 
-CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 \
-        train_ct_2D_flowmatching.py   \
+python  latent_tsne_ct.py   \
         --batch_size   2  \
         --dataset_csv $data_files   --task  $task \
         --gpu  $gpu      --input_modality   CT CTC    \
-        --lr    3e-4     \
+        --lr    3e-5     \
         --n_epochs  500  \
-        --grad_accum_steps 2  \
+        --grad_accum_steps 1  \
         --latent_dir $latent_dir  \
         --cache_dir ${temp}/cache/CT_all   \
         --output_dir $output_dir \
         --aekl_ckpt  $aekl_ckpt   \
-        --diff_ckpt $fm_ckpt   \
         --data_dir   $data_dir      --DEBUG
 
 
+        --diff_ckpt $fm_ckpt   \
 
+
+        
 
 python simple_fm.py \
     --lr 3e-4 \
@@ -146,51 +197,67 @@ python simple_fm.py \
     --num_workers 4
 
     
+    
+
 
 # -------------------- Train PMRF Flow Matching -----------------------
 
 # git clone https://github.com/ohayonguy/PMRF
 
+cd /home/hao/repo/FM-translation/code/STEP2-PMRF
 
 latent_dir=/date/hao/FM/latent/CT-CTC/2D
 data_dir=/date/hao/PairedContrast/CT/low_256x256_2Dimension
 output_dir=/date/hao/FM/latent/CT-CTC/2D
 aekl_ckpt=/date/hao/FM/checkpoint/CT/2D_AE/ae-58-CT-CTC.pth
 data_files=../data/files/2D_CT_pair.csv
+temp=/date/hao/FM
 
 conda activate pmrf
 #!/bin/bash
+gpu=5,6
+
+
+#  --precision "bf16-mixed" 
+
+# 32
+# 5e-5
 
 python train.py \
---precision "bf16-mixed" \
+--precision "16-mixed" \
 --stage "flow" \
---degradation "difface" \
---train_data_root "/path/to/data/ffhq512" \
---val_data_root "/path/to/data/celebahq_test_512" \
 --latent_dir  $latent_dir  \
 --dataset_csv $data_files \
 --aekl_ckpt   $aekl_ckpt   \
 --data_dir    $data_dir  \
 --arch "hdit_ImageNet256Sp4" \
 --num_flow_steps 50 \
---num_gpus 16 \
+--num_gpus 2 \
 --num_workers 80 \
---check_val_every_n_epoch 50 \
---train_batch_size 256 \
---val_batch_size 32 \
---img_size 512 \
+--num_channel 4 \
+--check_val_every_n_epoch 1 \
+--train_batch_size 16 \
+--val_batch_size 16 \
+--img_size 128 \
 --max_epochs 3850 \
 --ema_decay 0.9999 \
 --eps 0.0 \
 --t_schedule "stratified_uniform" \
---weight_decay 1e-2 \
---lr 5e-4 \
+--weight_decay 1e-3 \
+--lr 3e-4 \
 --source_noise_std 0.1 \
 --wandb_project_name "PMRF" \
 --wandb_group "Blind face restoration PMRF" \
 --mmse_model_arch "swinir_L" \
---mmse_model_ckpt_path "./checkpoints/swinir_restoration512_L1.pth"    # Path to the DifFace checkpoint of SwinIR
+--gpu  $gpu       \
+--aekl_ckpt  $aekl_ckpt   \
+--data_dir   $data_dir   
 
+
+
+# --degradation "difface" \
+# --train_data_root "/path/to/data/ffhq512" \
+# --val_data_root "/path/to/data/celebahq_test_512" \
 
 
 #   pip install torch_ema torchmetrics

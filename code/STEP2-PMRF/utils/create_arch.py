@@ -14,8 +14,8 @@ def create_arch(arch, condition_channels=0):
 arch_configs = {
     'hdit': {
         "ImageNet256Sp4": {
-            'in_channels': 3,
-            'out_channels': 3,
+            'in_channels': 16,
+            'out_channels': 16,
             'widths': [256, 512, 1024],
             'depths': [2, 2, 8],
             'patch_size': [4, 4],
@@ -30,8 +30,8 @@ arch_configs = {
             'mapping_dropout_rate': 0.0
         },
         "XL2": {
-            'in_channels': 3,
-            'out_channels': 3,
+            'in_channels': 16,
+            'out_channels': 16,
             'widths': [384, 768],
             'depths': [2, 11],
             'patch_size': [4, 4],
@@ -48,8 +48,8 @@ arch_configs = {
     },
     'swinir': {
         "M": {
-            'in_channels': 3,
-            'out_channels': 3,
+            'in_channels': 16,
+            'out_channels': 16,
             'embed_dim': 120,
             'depths': [6, 6, 6, 6, 6],
             'num_heads': [6, 6, 6, 6, 6],
@@ -58,8 +58,8 @@ arch_configs = {
 
         },
         "L": {
-            'in_channels': 3,
-            'out_channels': 3,
+            'in_channels': 16,
+            'out_channels': 16,
             'embed_dim': 180,
             'depths': [6, 6, 6, 6, 6, 6, 6, 6],
             'num_heads': [6, 6, 6, 6, 6, 6, 6, 6],

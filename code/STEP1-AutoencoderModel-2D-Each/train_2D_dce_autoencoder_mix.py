@@ -35,7 +35,6 @@ from utils.utils_image import save_image, pad_to_shape
 from src.dce_2D_dataloader import create_triplet_dataloader
 from accelerate import Accelerator
 
-from src.ct_2D_dataloader import create_paired_dataloader
 torch.autograd.set_detect_anomaly(True)
 warnings.filterwarnings("ignore")
 
@@ -52,10 +51,8 @@ DEVICE = accelerator.device
 valid_ratio = 0  # All mask
 train_ratio = 0  # 0.5  # Half mask
 
-use_standard_norm = args.use_standard_norm  # use_standard_norm
+use_standard_norm = args.use_standard_norm   # use_standard_norm
 use_broken        = args.use_broken  # True
-
-print(" === use_standard_norm:", use_standard_norm)
 
 ACTIVATION_CLASSES = (nn.ReLU, nn.LeakyReLU, nn.ELU, nn.PReLU, nn.RReLU)
 
@@ -126,6 +123,7 @@ def standard_normalize(x, mean=None, std=None, eps=1e-8):
         std = x.std(dim=tuple(range(1, x.ndim)), keepdim=True) + eps
 
     x_norm = (x - mean) / std
+
     x_norm = torch.clamp(x_norm, -6, 6)
 
     return x_norm, mean, std
@@ -201,24 +199,33 @@ def validate_model(model, dataloader, device, image_save_root=None, max_batches=
             if idx >= max_batches:
                 break
 
-            dce1 = batch['CT'].to(device)
-            dce2 = batch['CTC'].to(device)
-            images = torch.cat([dce1, dce2], dim=1)
+            dce1 = batch['DCE1'].to(device)
+            dce2 = batch['DCE2'].to(device)
+            dce3 = batch['DCE3'].to(device)
+            images = torch.cat([dce1, dce2, dce3], dim=1)
             
             if use_standard_norm:
                 dce1, dce1_mean, dce1_std    = standard_normalize(dce1)
                 dce2, dce2_mean, dce2_std    = standard_normalize(dce2)
+                dce3, dce3_mean, dce3_std    = standard_normalize(dce3)
 
+           
 
             # --- broken input (simulate missing DCE2/DCE3) ---
-            inputs, mask = [dce1, torch.zeros_like(dce1).to(device)], [True, False]  # DCE1 always present
-   
+            inputs, mask = [dce1], [True]  # DCE1 always present
+            for dce in [dce2, dce3]:
+                if np.random.rand() < 0.5:  # 50% chance to keep
+                    inputs.append(dce)
+                    mask.append(True)
+                else:
+                    inputs.append(torch.zeros_like(dce).to(device))
+                    mask.append(False)
 
             # print("mask = ", mask)
 
             # --- clean input (all modalities present) ---
-            clean_inputs = [dce1, dce2]
-            clean_mask   = [True, True]
+            clean_inputs = [dce1, dce2, dce3]
+            clean_mask   = [True, True, True]
 
             with accelerator.autocast():
                 clean_recon = model(clean_inputs, modalities_mask=clean_mask,
@@ -232,12 +239,14 @@ def validate_model(model, dataloader, device, image_save_root=None, max_batches=
             if use_standard_norm:
                 recon_dce1 = denormalize(reconstruction[:, 0:1], dce1_mean, dce1_std)
                 recon_dce2 = denormalize(reconstruction[:, 1:2], dce2_mean, dce2_std)
-                reconstruction = torch.cat([recon_dce1, recon_dce2], dim=1)
+                recon_dce3 = denormalize(reconstruction[:, 2:3], dce3_mean, dce3_std)
+                reconstruction = torch.cat([recon_dce1, recon_dce2, recon_dce3], dim=1)
 
                 # clean recon
                 clean_dce1 = denormalize(clean_recon[:, 0:1], dce1_mean, dce1_std)
                 clean_dce2 = denormalize(clean_recon[:, 1:2], dce2_mean, dce2_std)
-                clean_recon = torch.cat([clean_dce1, clean_dce2], dim=1)
+                clean_dce3 = denormalize(clean_recon[:, 2:3], dce3_mean, dce3_std)
+                clean_recon = torch.cat([clean_dce1, clean_dce2, clean_dce3], dim=1)
             else:
                 reconstruction = torch.clamp(reconstruction, 0, 1)
                 clean_recon    = torch.clamp(clean_recon, 0, 1)
@@ -269,21 +278,25 @@ def validate_model(model, dataloader, device, image_save_root=None, max_batches=
             # ---- metrics for broken input (split mask/unmask) ----
             for ch, (avg_psnr_unmask, avg_ssim_unmask, avg_psnr_mask, avg_ssim_mask) in enumerate([
                 (avg_psnr_dce1, avg_ssim_dce1, avg_psnr_dce1_mask, avg_ssim_dce1_mask),
-                (avg_psnr_dce2, avg_ssim_dce2, avg_psnr_dce2_mask, avg_ssim_dce2_mask)
+                (avg_psnr_dce2, avg_ssim_dce2, avg_psnr_dce2_mask, avg_ssim_dce2_mask),
+                (avg_psnr_dce3, avg_ssim_dce3, avg_psnr_dce3_mask, avg_ssim_dce3_mask),
             ]):
                 psnr, ssim = batch_psnr_ssim(image_np[:, ch:ch+1],
                                             recon_np[:, ch:ch+1],
                                             data_range=1.0)
                 
-                
-                avg_psnr_unmask.append(psnr)
-                avg_ssim_unmask.append(ssim)
-                
+                if mask[ch]:
+                    avg_psnr_unmask.append(psnr)
+                    avg_ssim_unmask.append(ssim)
+                else:
+                    avg_psnr_mask.append(psnr)
+                    avg_ssim_mask.append(ssim)
 
             # ---- metrics for clean input ----
             for ch, (avg_psnr, avg_ssim) in enumerate([
                 (avg_psnr_clean_dce1, avg_ssim_clean_dce1),
                 (avg_psnr_clean_dce2, avg_ssim_clean_dce2),
+                (avg_psnr_clean_dce3, avg_ssim_clean_dce3),
             ]):
                 psnr, ssim = batch_psnr_ssim(image_np[:, ch:ch+1],
                                             clean_recon_np[:, ch:ch+1],
@@ -299,12 +312,19 @@ def validate_model(model, dataloader, device, image_save_root=None, max_batches=
     print("-"*60)
 
     # DCE1
-    print(f"{'CT':<12} {'FULL':<10} {np.mean(avg_psnr_dce1):>8.2f} {np.mean(avg_ssim_dce1):>10.4f}")
-    print(f"{'CTC':<12} {'MASK':<10} {np.mean(avg_psnr_dce2):>8.2f} {np.mean(avg_ssim_dce2):>10.4f}")
+    print(f"{'DCE1':<12} {'FULL':<10} {np.mean(avg_psnr_dce1):>8.2f} {np.mean(avg_ssim_dce1):>10.4f}")
+    # print(f"{'DCE1':<12} {'MASK':<10} {np.mean(avg_psnr_dce1_mask):>8.2f} {np.mean(avg_ssim_dce1_mask):>10.4f}")
+    print(f"{'DCE2':<12} {'FULL':<10} {np.mean(avg_psnr_dce2):>8.2f} {np.mean(avg_ssim_dce2):>10.4f}")
+    print(f"{'DCE3':<12} {'FULL':<10} {np.mean(avg_psnr_dce3):>8.2f} {np.mean(avg_ssim_dce3):>10.4f}")
+
+    # DCE3
+    print(f"{'DCE2':<12} {'MASK':<10} {np.mean(avg_psnr_dce2_mask):>8.2f} {np.mean(avg_ssim_dce2_mask):>10.4f}")
+    print(f"{'DCE3':<12} {'MASK':<10} {np.mean(avg_psnr_dce3_mask):>8.2f} {np.mean(avg_ssim_dce3_mask):>10.4f}")
 
     # CLEAN (always available, so no mask/unmask split)
-    print(f"{'CLEAN CT':<12} {'FULL':<10} {np.mean(avg_psnr_clean_dce1):>8.2f} {np.mean(avg_ssim_clean_dce1):>10.4f}")
-    print(f"{'CLEAN CTC':<12} {'FULL':<10} {np.mean(avg_psnr_clean_dce2):>8.2f} {np.mean(avg_ssim_clean_dce2):>10.4f}")
+    print(f"{'CLEAN DCE1':<12} {'FULL':<10} {np.mean(avg_psnr_clean_dce1):>8.2f} {np.mean(avg_ssim_clean_dce1):>10.4f}")
+    print(f"{'CLEAN DCE2':<12} {'FULL':<10} {np.mean(avg_psnr_clean_dce2):>8.2f} {np.mean(avg_ssim_clean_dce2):>10.4f}")
+    print(f"{'CLEAN DCE3':<12} {'FULL':<10} {np.mean(avg_psnr_clean_dce3):>8.2f} {np.mean(avg_ssim_clean_dce3):>10.4f}")
     print("="*60 + "\n")
 
 
@@ -317,16 +337,15 @@ missing_modality = args.missing_modality
 
 from MM_AE import AutoencoderKL_multi_encoder
 
+from SM_AE import AutoencoderKL_single_encoder
+
 def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
     from huggingface_hub import snapshot_download
     from diffusers import AutoencoderKL
 
     
     from diffusers.models import AutoencoderKL
-    # block_out_channels=(128, 256)  # (256, 512)
-    # layers_per_block = 3
-    
-    block_out_channels=(128, 128, 256)  # (256, 512)
+    block_out_channels=(128, 256)  # (256, 512)
     layers_per_block = 3
 
     # block_out_channels=(64, 128, 256) # 128, 256
@@ -335,6 +354,7 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
     n_blocks = len(block_out_channels)
 
     vae = AutoencoderKL_multi_encoder(
+    # vae = AutoencoderKL_single_encoder(
         num_encode = in_channels,
         in_channels=1, out_channels=out_channels, latent_channels=latent_channels,
         block_out_channels=block_out_channels, 
@@ -347,7 +367,6 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
 
 
     return vae
-
 
 
 
@@ -378,13 +397,14 @@ def latent_mixup(z_clean, z_broken, alpha=0.5):
 
 
 
+
 if __name__ == '__main__':
 
     image_key = args.input_modality
     
     
     # Image
-    image_save_root = "./image_result/step1_ae_train_ct/"
+    image_save_root = "./image_result/step1_ae_train_dce/"
     os.makedirs(image_save_root, exist_ok=True)
     
     if isinstance(image_key, (list, tuple)):
@@ -407,8 +427,8 @@ if __name__ == '__main__':
     key_to_load  = []         
     key_to_load.extend(image_key)
 
-    train_loader, train_ds     = create_paired_dataloader(csv_path=args.dataset_csv, resolution=256, split="train", batch_size=args.batch_size, spatial_size=spatial_size)
-    test_loader,  test_ds      = create_paired_dataloader(csv_path=args.dataset_csv, resolution=256, split="test",  batch_size=args.batch_size, spatial_size=spatial_size)
+    train_loader, train_ds     = create_triplet_dataloader(csv_path=args.dataset_csv, resolution=256, split="train", batch_size=args.batch_size, spatial_size=spatial_size)
+    test_loader,  test_ds      = create_triplet_dataloader(csv_path=args.dataset_csv, resolution=256, split="test",  batch_size=args.batch_size, spatial_size=spatial_size)
 
 
     # ---------------- Define AutoEncoder Model ----------------
@@ -447,8 +467,8 @@ if __name__ == '__main__':
             print(f"Autoencoder checkpoint not found: {gen_path}. Starting from scratch.")
         print("Resuming from checkpoint:", gen_path)
 
-    use_mask_loss     = False
-    use_adv           = True  #not args.use_broken
+    use_mask_loss     = False  # False
+    use_adv           = True  # not args.use_broken
     use_kl_loss       = True
 
     adv_weight        = 0.025
@@ -538,6 +558,9 @@ if __name__ == '__main__':
         autoencoder.train()
         discriminator.train()
 
+        # print(" len(train_loader)=", len(train_loader))
+
+
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader))
         progress_bar.set_description(f'Epoch {epoch}')
 
@@ -551,54 +574,69 @@ if __name__ == '__main__':
             if step > 200:  # 390
                 break
 
-            ct     = batch['CT'].to(DEVICE)
-            ctc    = batch['CTC'].to(DEVICE)
-
+            dce1    = batch['DCE1'].to(DEVICE)
+            dce2    = batch['DCE2'].to(DEVICE)
+            dce3    = batch['DCE3'].to(DEVICE)
 
             if use_standard_norm:
-                ct , ct_mean, ct_std    = standard_normalize(ct)
-                ctc, ctc_mean, ctc_std  = standard_normalize(ctc)
-            
+                dce1, dce1_mean, dce1_std    = standard_normalize(dce1)
+                dce2, dce2_mean, dce2_std    = standard_normalize(dce2)
+                dce3, dce3_mean, dce3_std    = standard_normalize(dce3)
 
-            images           = torch.cat([ct, ctc], dim=1)
+            images           = torch.cat([dce1, dce2, dce3], dim=1)
             double_images    = torch.cat([images, images, images], dim=0)
 
-            clean_inputs           = [ct, ctc]
-            clean_modalities_mask  = [True, True]
+            clean_inputs           = [dce1, dce2, dce3]
+            clean_modalities_mask  = [True, True, True]
+
+            import random
+            def random_drop_modalities(inputs, device):
+                """
+                inputs: list of [dce1, dce2, dce3]
+                device: torch device
+                """
+                n_drop = random.choice([1, 2])  # randomly decide to drop 1 or 2
+                drop_indices = random.sample(range(len(inputs)), n_drop)
+
+                broken_inputs = []
+                broken_modalities_mask = []
+
+                for i, dce in enumerate(inputs):
+                    if i in drop_indices:
+                        broken_inputs.append(torch.zeros_like(dce).to(device))
+                        broken_modalities_mask.append(False)
+                    else:
+                        broken_inputs.append(dce)
+                        broken_modalities_mask.append(True)
+
+                return broken_inputs, broken_modalities_mask
+
+            # Example usage
+            inputs = [dce1, dce2, dce3]
+            broken_inputs, broken_modalities_mask = random_drop_modalities(inputs, DEVICE)
 
 
-            # r = np.random.rand()
-            
-            broken_inputs = [ct, ctc]
-            broken_modalities_mask   = [True, True]
-        
-            B = ct.shape[0]
-            # r = torch.rand((B,1)).item()
+            # broken_inputs = [dce1]
+            # broken_modalities_mask   = [True]
 
-            if np.random.rand() < 0.5:  # 50% chance to keep
-                # ctc_mix = ctc * r + (1 - r) * ct  # Mix
-                # ctc_mix = ctc_mix.detach()
+            # # Randomly drop dce2 and dce3
+            # for dce in [dce2, dce3]:
+            #     if np.random.rand() < 0.5:  # 50% chance to keep
+            #         # r = torch.rand(1).item()  # get a single random scalar
+            #         # dce = dce * r + (1 - r) * dce1
+            #         # dce = dce.detach()
+            #         dce = 
+            #         broken_inputs.append(dce)
+            #         broken_modalities_mask.append(True)
+            #     else:
+            #         broken_inputs.append(torch.zeros_like(dce).to(DEVICE))
+            #         broken_modalities_mask.append(False)
 
-                ctc_mix = ct.detach()
-                broken_inputs = [ct, ctc_mix]
-                
-                # if np.random.rand() < 0.5:
-                broken_modalities_mask   = [True, False]
-                
-            else:
-                # ct_mix = ct * r + (1 - r) * ctc
-                # ct_mix = ct_mix.detach()
-                ct_mix = ctc.detach()   
-                broken_inputs = [ct_mix, ctc]
-                
-                # if np.random.rand() < 0.5:
-                broken_modalities_mask   = [False, True]
+
 
             broken_double_images    = torch.cat([images, torch.cat(broken_inputs, dim=1)], dim=0)
             broken_double_images    = broken_double_images.detach()
-
-            # print("broken_double_images shape=", broken_double_images.shape, double_images.shape)
-
+            
 
             # with autocast(enabled=True):
             with accelerator.autocast():
@@ -630,7 +668,7 @@ if __name__ == '__main__':
                 z_mix = latent_mixup(z, b_z)
                 dec_out = autoencoder.decode(z_mix)              # DecoderOutput
                 mix_reconstruction = dec_out.sample
-
+            
                 # Decode
                 dec_out = autoencoder.decode(z)              # DecoderOutput
                 reconstruction = dec_out.sample
@@ -641,9 +679,10 @@ if __name__ == '__main__':
                 reconstruction = torch.cat([reconstruction, broken_reconstruction, mix_reconstruction], dim=0)
 
             gen_loss = torch.tensor(0).to(reconstruction.device)
-            with accelerator.autocast():
-                if use_adv:
-                    logits_fake = discriminator(reconstruction.contiguous())[-1]
+            # with accelerator.autocast():
+            
+            if use_adv:
+                logits_fake = discriminator(reconstruction.contiguous())[-1]
                     
              
             if use_adv:           
@@ -655,9 +694,7 @@ if __name__ == '__main__':
             else:
                 rec_loss = l1_loss_fn(reconstruction, broken_double_images) 
                 
-
-            kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) + \
-                                     kl_loss_fn(broken_z_mu, broken_z_sigma) )
+            kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) + kl_loss_fn(broken_z_mu, broken_z_sigma) )
 
             B, C, H, W = reconstruction.shape
 
@@ -665,19 +702,21 @@ if __name__ == '__main__':
             # --------------- Perceptural Loss ---------------
             recon_dce1 = reconstruction[:, 0:1].repeat(1,3,1,1)
             recon_dce2 = reconstruction[:, 1:2].repeat(1,3,1,1)
-
+            recon_dce3 = reconstruction[:, 2:3].repeat(1,3,1,1)
             if not use_mask_loss:
                 image_dce1 = double_images[:, 0:1].repeat(1,3,1,1)
                 image_dce2 = double_images[:, 1:2].repeat(1,3,1,1)
+                image_dce3 = double_images[:, 2:3].repeat(1,3,1,1)
             else:
                 image_dce1 = broken_double_images[:, 0:1].repeat(1,3,1,1)
                 image_dce2 = broken_double_images[:, 1:2].repeat(1,3,1,1)
+                image_dce3 = broken_double_images[:, 2:3].repeat(1,3,1,1)
 
             # Duplicate each channel 3× → [B,3,H,W]
 
             # Stack along batch dim → [B*2, 3, H, W]
-            reconstruction_3ch = torch.cat([recon_dce1,  recon_dce2],  dim=0)
-            images_3ch         = torch.cat([image_dce1,  image_dce2],  dim=0)
+            reconstruction_3ch = torch.cat([recon_dce1,  recon_dce2, recon_dce3],  dim=0)
+            images_3ch         = torch.cat([image_dce1,  image_dce2, image_dce3],  dim=0)
 
             per_loss = torch.tensor(0).to(reconstruction.device)
 
@@ -734,16 +773,17 @@ if __name__ == '__main__':
             loss_latent = kl_gaussians(broken_z_mu.float(), 
                                        broken_z_sigma.float(), 
                                        z_mu.detach().float(), 
-                                       z_sigma.detach().float()) + \
-                                       F.mse_loss(broken_z_mu, z_mu.detach())
+                                       z_sigma.detach().float()) + F.mse_loss(broken_z_mu, z_mu.detach())
             
-            loss_latent = 0.01 * loss_latent
+            loss_latent = 0.001 * loss_latent
           
+            # print("loss_latent=", loss_latent.item(), torch.sum(z_mu - broken_z_mu), broken_modalities_mask)
+
             loss_g = rec_loss + kld_loss + gen_loss + per_loss # + loss_latent
 
-            progress_bar.set_postfix(loss_g=loss_g.item()         if hasattr(loss_g, "item") else loss_g,
+            progress_bar.set_postfix(loss_g=loss_g.item()      if hasattr(loss_g, "item") else loss_g,
                                         latent=loss_latent.item() if hasattr(loss_latent, "item") else loss_latent,
-                                        per_loss=per_loss.item()  if hasattr(per_loss, "item") else per_loss,
+                                        per_loss=per_loss.item()  if hasattr(loss_g, "item") else per_loss,
                                         rec_loss=rec_loss.item()  if hasattr(rec_loss, "item") else rec_loss,
                                         kld_loss=kld_loss.item()  if hasattr(kld_loss, "item") else kld_loss,
                                         gen_loss=gen_loss.item()  if hasattr(gen_loss, "item") else gen_loss)
@@ -793,9 +833,9 @@ if __name__ == '__main__':
 
             # ⚠️ This is a workaround, but should be improved
             if use_adv:
-                with accelerator.autocast():
-                    fake_images = reconstruction.detach()  # Detach to cut generator graph
-                    logits_real = discriminator(images.contiguous())[-1]   # .contiguous().detach()
+                # with accelerator.autocast():
+                fake_images = reconstruction.detach()  # Detach to cut generator graph
+                logits_real = discriminator(images.contiguous())[-1]   # .contiguous().detach()
                 d_loss_real = adv_loss_fn(logits_real, target_is_real=True, for_discriminator=True)
 
                 discriminator_loss = (d_loss_real) * 0.5
@@ -806,9 +846,9 @@ if __name__ == '__main__':
 
                 del logits_real, loss_d
           
-                with accelerator.autocast():
-                    fake_images = reconstruction.detach()  # Detach to cut generator graph
-                    logits_fake = discriminator(fake_images.contiguous())[-1]
+                # with accelerator.autocast():
+                fake_images = reconstruction.detach()  # Detach to cut generator graph
+                logits_fake = discriminator(fake_images.contiguous())[-1]
 
                 d_loss_fake = adv_loss_fn(logits_fake, target_is_real=False, for_discriminator=True)
 

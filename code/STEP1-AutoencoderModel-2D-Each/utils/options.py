@@ -16,7 +16,7 @@ parser.add_argument('--num_workers', default=12, type=int, help='Number of worke
 parser.add_argument('--num_samples', default=2, type=int, help='Number of samples per CT scan')
 parser.add_argument('--input_modality', nargs='+', required=True, help='List of modalities (e.g., t1c t1n t2w t2f)')
 parser.add_argument('--missing_modality', nargs='+', required=True, help='List of modalities (e.g., t1c t1n t2w t2f)')
-
+parser.add_argument('--use_standard_norm', action='store_true', help='Use standard normalization (mean-std) instead of min-max')
 
 # ---------------- Paths ----------------
 parser.add_argument('--data_dir', default="", type=str, help="Directory containing the dataset")

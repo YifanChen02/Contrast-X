@@ -12,17 +12,15 @@ from PIL import Image
 from torchvision import transforms
 
 
-target_dataset = ["Adrenal"]
-# target_dataset = ["Adrenal", "Bladder", "Lung", "Stomach", "Uterus"]
 
 
 class PairedLatentDataset(Dataset):
     """
     Expects CSV with header:
-    Dataset,Subject,ExamID,Slice,Splits,CT,CTC
+    Dataset,Subject,ExamID,Slice,Split,DCE1,DCE2,DCE3
 
-    Instead of loading CT.jpg/CTC.jpg, this dataset loads
-    latent tensors saved as OUT_ROOT/.../CT.npz and CTC.npz.
+    Instead of loading .jpg directly, this dataset loads
+    latent tensors saved as OUT_ROOT/.../DCE1.npz etc.
     """
 
     def __init__(
@@ -30,21 +28,18 @@ class PairedLatentDataset(Dataset):
         csv_path: str,
         data_root: str,
         out_root: str,
-        target_dataset: list = target_dataset,
-        split: Optional[str] = None,       # "train" | "val" | "test" | None
+        target_dataset: list = None,
+        split: Optional[str] = None,
         spatial_size: Optional[int] = None,
         random_hflip: bool = False,
     ):
         df = pd.read_csv(csv_path)
-
-        df = df[df["Dataset"].apply(lambda x: x.split("_")[0]).isin(target_dataset)]
-
-        # shuffle with fixed seed if needed
+        # df = df[df["Dataset"].apply(lambda x: x.split("_")[0]).isin(target_dataset)]
         df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-        df["Splits"] = df["Splits"].fillna("").str.lower()
+        df["Split"] = df["Split"].fillna("").str.lower()
 
         if split is not None and split != "test_all":
-            df = df[df["Splits"] == split.lower()]
+            df = df[df["Split"] == split.lower()]
 
         self.df = df.reset_index(drop=True)
         self.items = df.to_dict(orient="records")
@@ -61,77 +56,73 @@ class PairedLatentDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
-
     def _latent_path(self, img_path: str, name: str):
         img_path = Path(img_path)
-
-        # ---- get "patient_path" you asked for ----
         rel_dir = img_path.relative_to(self.data_root).parent
-        patient_path = str(rel_dir)  # "Stomach_Colon_Liver_Pancreas_CT_train_val_test/train/HCC_023_1999-12-24_CT/slice_033"
-
-        # ---- make an output dir that mirrors the dataset tree ----
         out_dir = self.out_root / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        destpath = out_dir / f"{name}.npz" # 'CT.npz'
-        return destpath
-
+        return out_dir / f"{name}.npz"
 
     def _load_gray(self, path: str) -> Image.Image:
         return Image.open(path).convert("L")
 
-
     def _load_latent(self, path):
-        if path is None:
-            raise ValueError("Tried to load latent from None path")
         arr = np.load(str(path), allow_pickle=False)["data"]
         return torch.from_numpy(arr)
-    
 
     def __getitem__(self, idx: int):
         it = self.items[idx]
 
-        ct_path  = self._latent_path(it["CT"], "CT")
-        ctc_path = self._latent_path(it["CTC"], "CT_CTC")
+        # latent paths
+        dce1_path = self._latent_path(it["DCE1"], "DCE_1")
+        dce2_path = self._latent_path(it["DCE2"], "DCE_13")
+        dce3_path = self._latent_path(it["DCE3"], "DCE_123")    # DCE_123
 
-        ct_img  = self._load_gray(it["CT"])
-        ctc_img = self._load_gray(it["CTC"])
-        ct_img  = TF.to_tensor(ct_img)   # [1,H,W], float32 [0,1]
-        ctc_img = TF.to_tensor(ctc_img)
+        # load images
+        dce1_img = TF.to_tensor(self._load_gray(it["DCE1"]))
+        dce2_img = TF.to_tensor(self._load_gray(it["DCE2"]))
+        dce3_img = TF.to_tensor(self._load_gray(it["DCE3"]))
 
         if self.spatial_size:
-            i, j, h, w = transforms.RandomCrop.get_params(
-                ct_img, output_size=(self.spatial_size[0], self.spatial_size[1])
-            )
-            ct_img  = TF.crop(ct_img, i, j, h, w)
-            ctc_img = TF.crop(ctc_img, i, j, h, w)
+            i, j, h, w = transforms.RandomCrop.get_params(dce1_img, output_size=self.spatial_size)
+            dce1_img = TF.crop(dce1_img, i, j, h, w)
+            dce2_img = TF.crop(dce2_img, i, j, h, w)
+            dce3_img = TF.crop(dce3_img, i, j, h, w)
 
-        ct  = self._load_latent(ct_path)
-        ctc = self._load_latent(ctc_path)
+        # load latents
+        dce1 = self._load_latent(dce1_path)
+        dce2 = self._load_latent(dce2_path)
+        dce3 = self._load_latent(dce3_path)
 
-        # flip (same coin for both) if image-like
-        # if self.random_hflip and random.random() < 0.5 and ct.ndim >= 2:
-        #     if ct.ndim == 2:  # [H,W]
-        #         ct  = TF.hflip(ct.unsqueeze(0)).squeeze(0)
-        #         ctc = TF.hflip(ctc.unsqueeze(0)).squeeze(0)
-        #     else:  # [C,H,W]
-        #         ct  = TF.hflip(ct)
-        #         ctc = TF.hflip(ctc)
-
+        # random flip
+        # if self.random_hflip and random.random() < 0.5:
+        #     if dce1.ndim == 2:
+        #         dce1 = TF.hflip(dce1.unsqueeze(0)).squeeze(0)
+        #         dce2 = TF.hflip(dce2.unsqueeze(0)).squeeze(0)
+        #         dce3 = TF.hflip(dce3.unsqueeze(0)).squeeze(0)
+        #     else:
+        #         dce1 = TF.hflip(dce1)
+        #         dce2 = TF.hflip(dce2)
+        #         dce3 = TF.hflip(dce3)
 
         meta = {
             "Dataset": it["Dataset"],
             "Subject": it["Subject"],
             "ExamID":  it["ExamID"],
             "Slice":   it["Slice"],
-            "Splits":  it["Splits"],
-            "CT_path": str(ct_path),
-            "CTC_path": str(ctc_path),
-            "CT_img": ct_img,
-            "CTC_img": ctc_img,
+            "Split":  it["Split"],
 
-            "CT": ct.float(),
-            "CTC": ctc.float(),
+            "DCE1_path": str(dce1_path),
+            "DCE2_path": str(dce2_path),
+            "DCE3_path": str(dce3_path),
+
+            "DCE1_img": dce1_img,
+            "DCE2_img": dce2_img,
+            "DCE3_img": dce3_img,
+
+            "DCE_1": dce1.float(),
+            "DCE_13": dce2.float(),
+            "DCE_123": dce3.float(),
         }
         return meta
 
@@ -148,7 +139,6 @@ def create_paired_dataloader(
     num_workers: int = 4,
     pin_memory: bool = True,
     random_hflip: bool = True,
-    # is_train: bool = True,
 ):
     if shuffle is None:
         shuffle = (split == "train")

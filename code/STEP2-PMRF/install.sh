@@ -13,3 +13,4 @@ pip install git+https://github.com/toshas/torch-fidelity.git --no-input
 pip install lpips==0.1.4 --no-input
 pip install piq==0.8.0 --no-input
 pip install huggingface_hub==0.24.5 --no-input
+pip install pandas

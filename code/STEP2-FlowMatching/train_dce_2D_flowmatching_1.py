@@ -26,7 +26,7 @@ from collections import OrderedDict
 from copy import deepcopy
 
 from src import diffusion
-from src.ct_2D_latent_dataloader import create_paired_dataloader
+from src.dce_2D_latent_dataloader import create_paired_dataloader
 from accelerate import DistributedDataParallelKwargs
 
 from src import networks
@@ -191,7 +191,7 @@ def sample_using_diffusion(
         beta_end: float = 0.0205,
         verbose: bool = True,
         epoch: int = 0,                   # save plot per epoch
-        save_dir: str = "error_plot/CT"      # save directory
+        save_dir: str = "error_plot/DCE"      # save directory
 ) -> torch.Tensor:
     """
     Sampling random brain MRIs that follow the covariates in `context`.
@@ -201,26 +201,7 @@ def sample_using_diffusion(
     # initialize latent with x0
     z = x0.clone()
 
-    # Linear
-    #
     t_steps = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device)
-    # dt = t_steps[1] - t_steps[0]
-
-    # sigma_max = 1.0    # largest noise (you can tune)
-    # sigma_min = 0.001  # smallest noise
-
-    # # log-uniform interpolation of σ
-    # sigmas = torch.exp(
-    #     torch.linspace(torch.log(torch.tensor(sigma_max)),
-    #                 torch.log(torch.tensor(sigma_min)),
-    #                 num_inference_steps+1, device=device)
-    # )
-    # t_steps = invert_sigma(sigmas, sigma_min=0.05, device=device)
-
-    # Beta(2,2)
-
-    # t_steps = t_schedule.make_inference_t_steps(num_inference_steps + 1)
-
 
     mae_values = []  # store MAE per timestep
     mae_values = []
@@ -268,9 +249,9 @@ def sample_using_diffusion(
     return x
 
 mask_key       = "mask"
-latent_key     = "CTC"
-file_key       = "CT_path"  # CTC_path
-broken_latent_key = "CT"
+latent_key     = "DCE_123"
+file_key       = "DCE1_path"  # CTC_path
+broken_latent_key = "DCE_1"  # DCE_13
 
 
 def remove_module_prefix(state_dict):
@@ -455,7 +436,7 @@ def standard_normalize(x, mean=None, std=None, eps=1e-8):
     if mean is None:
         mean = x.mean(dim=tuple(range(1, x.ndim)), keepdim=True)
     if std is None:
-        std  = x.std(dim=tuple(range(1, x.ndim)), keepdim=True) + eps
+        std = x.std(dim=tuple(range(1, x.ndim)), keepdim=True) + eps
 
     x_norm = (x - mean) / std
 
@@ -494,8 +475,8 @@ def images_to_tensorboard(
     Visualize the generation on tensorboard
     """
 
-    ct_img = batch["CT_img"]
-    ctc_img = batch["CTC_img"]
+    ct_img = batch["DCE2_img"]
+    ctc_img = batch["DCE3_img"]
 
     if use_standard_norm:
         ct_img, ct_mean, ct_std    = standard_normalize(ct_img)
@@ -529,7 +510,7 @@ def images_to_tensorboard(
 
 
 
-    save_root = "./fm_samples/CT"
+    save_root = "./fm_samples/DCE"
     os.makedirs(save_root, exist_ok=True)
 
    
@@ -849,7 +830,6 @@ if __name__ == '__main__':
                 if args.DEBUG and step >= 10:
                     print(f"[DEBUG] Step {step}: {batch[latent_key].shape}")
                     break
-
                 
                 loss = 0
                 # with autocast(device_type='cuda',enabled=True):
@@ -865,7 +845,7 @@ if __name__ == '__main__':
 
                     x0        = batch[broken_latent_key].to(DEVICE).clone() * scale_factor[0]
                     x1        = batch[latent_key].to(DEVICE).clone() * scale_factor[1]
-                    ctc_image = batch["CTC_img"].to(DEVICE)
+                    ctc_image = batch["DCE3_img"].to(DEVICE)
 
                     ctc_norm, ctc_image_mean, ctc_image_std = standard_normalize(ctc_image)
 
@@ -875,14 +855,13 @@ if __name__ == '__main__':
                     xt, eps, sigma_t = compute_xt(x0, x1, t, sigma_min=sigma)
                     ut = compute_ut(x0, x1, t, eps, sigma_t, sigma_min=sigma)
 
+                    # x_t = (1 - t_img) * x_0 + t_img * x_1         # [B, 1, H, W]
+                    # ut = x_1 - x_0                              # [B, 1, H, W]
                    
                     pred = diffusion(xt, t) #x=xt, timesteps=t, context=None)
 
-                    # mse_loss = F.mse_loss(pred, ut)  # MSE Loss
-                    mse_loss = charbonnier_smooth_l1_loss(pred, ut)
-
-                    t = t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-                    x1_pred = xt + (1-t) * pred
+                    mse_loss = F.mse_loss(pred, ut)  # MSE Loss
+                    x1_pred = x0 + pred
 
                     import torch
                     def flatten_latent(z):
@@ -919,10 +898,10 @@ if __name__ == '__main__':
 
 
 
-                    rec_loss = F.mse_loss(pred, ut)   #0.1 * compute_mmd(x1_pred, x1)
+                    rec_loss = 0.1 * compute_mmd(x1_pred, x1)
                     # loss_mmd = compute_mmd(z1_to_2, z2)
 
-                    loss += mse_loss + rec_loss
+                    loss += mse_loss # + rec_loss
                     
                     # adv_loss_fn
                 if use_adv:
@@ -938,11 +917,10 @@ if __name__ == '__main__':
 
                 recon = ae.decode((x1_pred / scale_factor[1])).sample
                 recon = recon[:, 1:2, :, :] #.unsqueeze(1)  # only CTC channel
-                ae_loss = F.l1_loss(recon, ctc_norm)  
-
+                ae_loss = F.l1_loss(recon, ctc_norm)  # 0.1
                 loss += ae_loss
 
-                # kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) )
+                    # kld_loss = kl_weight * ( kl_loss_fn(z_mu, z_sigma) )
 
                 #     if epoch > 10:
                 #         

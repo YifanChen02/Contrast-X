@@ -52,7 +52,7 @@ DEVICE = accelerator.device
 valid_ratio = 0  # All mask
 train_ratio = 0  # 0.5  # Half mask
 
-use_standard_norm = True # use_standard_norm
+use_standard_norm = args.use_standard_norm #True # use_standard_norm
 use_broken        = args.use_broken  # True
 
 ACTIVATION_CLASSES = (nn.ReLU, nn.LeakyReLU, nn.ELU, nn.PReLU, nn.RReLU)
@@ -236,7 +236,10 @@ def validate_model(model, dataloader, device, image_save_root=None, max_batches=
                 clean_dce1 = denormalize(clean_recon[:, 0:1], dce1_mean, dce1_std)
                 clean_dce2 = denormalize(clean_recon[:, 1:2], dce2_mean, dce2_std)
                 clean_recon = torch.cat([clean_dce1, clean_dce2], dim=1)
-
+            else:
+                reconstruction = torch.clamp(reconstruction, 0, 1)
+                clean_recon    = torch.clamp(clean_recon, 0, 1)
+                
 
 
             image_np       = images.cpu().numpy()
@@ -319,7 +322,10 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
 
     
     from diffusers.models import AutoencoderKL
-    block_out_channels=(128, 256)  # (256, 512)
+    # block_out_channels=(128, 256)  # (256, 512)
+    # layers_per_block = 3
+
+    block_out_channels=(128, 128, 256)  # (256, 512)
     layers_per_block = 3
 
     # block_out_channels=(64, 128, 256) # 128, 256
@@ -361,13 +367,15 @@ if __name__ == '__main__':
     if message != "":
         image_key_str += f"-{message}"
 
+    if not use_standard_norm:
+        image_key_str += "-minmax"
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ---------------- Define Dataloader ----------------
     in_channels = len(image_key)  # 4 channels:
     dimension = 2
-    latent_channels = 6  # 4, 8, 16
+    latent_channels = 16  # 4, 8, 16
     spatial_size = (144, 144)    # (256, 256, 64)
     # spatial_size = (256, 256)  # bs = 8
 
@@ -420,7 +428,7 @@ if __name__ == '__main__':
 
     adv_weight        = 0.025
     perceptual_weight = 0.1     # if  args.use_broken else 0.0  # 0.1  
-    kl_weight         = 1e-3  # 1e-7
+    kl_weight         = 1e-7  # 1e-7
 
     def charbonnier(x, y, eps=1e-3):
         return torch.mean(torch.sqrt((x - y)**2 + eps**2))
@@ -583,8 +591,8 @@ if __name__ == '__main__':
 
                 enc_out = autoencoder.encode_multi(broken_inputs, broken_modalities_mask)       # EncodeOutput, (self, inputs, mask, return_dict=True):
                 broken_z_dist  = enc_out.latent_dist                # Normal distribution
-                broken_z_mu    = z_dist.mean
-                broken_z_sigma = z_dist.std
+                broken_z_mu    = broken_z_dist.mean
+                broken_z_sigma = broken_z_dist.std
 
 
                 use_sample_training = True   #False
@@ -703,9 +711,9 @@ if __name__ == '__main__':
                                        z_sigma.detach().float()) + \
                                        F.mse_loss(broken_z_mu, z_mu.detach())
             
-            loss_latent = 0.1 * loss_latent
+            loss_latent = 0.01 * loss_latent
           
-            loss_g = rec_loss + kld_loss + gen_loss + per_loss + loss_latent
+            loss_g = rec_loss + kld_loss + gen_loss + per_loss # + loss_latent
 
             progress_bar.set_postfix(loss_g=loss_g.item()         if hasattr(loss_g, "item") else loss_g,
                                         latent=loss_latent.item() if hasattr(loss_latent, "item") else loss_latent,

@@ -109,6 +109,8 @@ class PairedLatentDataset(Dataset):
         ct  = self._load_latent(ct_path)
         ctc = self._load_latent(ctc_path)
 
+        # print("Loaded latent shapes:", ct.shape, ctc.shape)
+
         # flip (same coin for both) if image-like
         # if self.random_hflip and random.random() < 0.5 and ct.ndim >= 2:
         #     if ct.ndim == 2:  # [H,W]

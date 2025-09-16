@@ -20,6 +20,10 @@ from utils.img_utils import create_grid
 from huggingface_hub import PyTorchModelHubMixin
 
 
+# Reverse
+broken_latent_key = "CTC"
+clean_latent_key  = "CT"
+
 
 class MMSERectifiedFlow(LightningModule,
                         PyTorchModelHubMixin,
@@ -82,6 +86,8 @@ class MMSERectifiedFlow(LightningModule,
             assert not conditional
             self.model = create_arch(arch, 0)
             self.mmse_model = None
+
+
         if 'flow' in stage:
             self.fid = FrechetInceptionDistance(reset_real_features=True, normalize=True)
             self.inception_score = InceptionScore(normalize=True)
@@ -187,8 +193,8 @@ class MMSERectifiedFlow(LightningModule,
             raise NotImplementedError()
 
     def training_step(self, batch, batch_idx):
-        x = batch['x']
-        y = batch['y']
+        x = batch[clean_latent_key]
+        y = batch[broken_latent_key]
         non_noisy_z0 = batch['non_noisy_z0'] if 'non_noisy_z0' in batch else None
         if 'flow' in self.hparams.stage:
             with torch.no_grad():
@@ -201,6 +207,11 @@ class MMSERectifiedFlow(LightningModule,
             xhat = self(x_t=None, t=None, y=y)
             loss = mse_loss(xhat, x)
         self.log("train/loss", loss)
+        
+        # train_loss.append(loss)
+
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
         return loss
 
     @torch.no_grad()
@@ -228,8 +239,10 @@ class MMSERectifiedFlow(LightningModule,
             return xhat.to(result_device), x_t_seq, source_dist_samples
 
     def validation_step(self, batch, batch_idx):
-        x = batch['x']
-        y = batch['y']
+        x = batch[clean_latent_key]  
+        y = batch[broken_latent_key]
+
+
         non_noisy_z0 = batch['non_noisy_z0'] if 'non_noisy_z0' in batch else None
         xhat, x_t_seq, source_dist_samples = self.generate_reconstructions(x, y, non_noisy_z0, self.hparams.num_flow_steps,
                                                                            self.device)
@@ -239,36 +252,43 @@ class MMSERectifiedFlow(LightningModule,
                       batch_size=x.shape[0])
 
         if 'flow' in self.hparams.stage:
-            self.fid.update(x, real=True)
-            self.fid.update(xhat, real=False)
-            self.inception_score.update(xhat)
+            # self.fid.update(x, real=True)
+            # self.fid.update(xhat, real=False)
+            # self.inception_score.update(xhat)
+            pass # TODO
 
         if batch_idx == 0:
             wandb_logger = self.logger.experiment
-            wandb_logger.log({'val_images/x': [wandb.Image(to_pil_image(create_grid(x)))],
-                              'val_images/y': [wandb.Image(to_pil_image(create_grid(y.clip(0, 1))))],
-                              'val_images/xhat': [wandb.Image(to_pil_image(create_grid(xhat)))], })
-            if 'flow' in self.hparams.stage:
-                wandb_logger.log({'val_images/x_t_seq': [wandb.Image(to_pil_image(create_grid(
-                    torch.cat([elem[0].unsqueeze(0).to(torch.float32) for elem in x_t_seq], dim=0).clip(0, 1),
-                    num_images=len(x_t_seq))))], 'val_images/source_distribution_samples': [
-                    wandb.Image(to_pil_image(create_grid(source_dist_samples.clip(0, 1).to(torch.float32))))]})
-                if self.mmse_model is not None:
-                    xhat_mmse = self.mmse_model(y).clip(0, 1)
-                    wandb_logger.log({'val_images/xhat_mmse': [
-                        wandb.Image(to_pil_image(create_grid(xhat_mmse.to(torch.float32))))]})
+
+            # TODO Save Image
+            # wandb_logger.log({'val_images/x': [wandb.Image(to_pil_image(create_grid(x)))],
+            #                   'val_images/y': [wandb.Image(to_pil_image(create_grid(y.clip(0, 1))))],
+            #                   'val_images/xhat': [wandb.Image(to_pil_image(create_grid(xhat)))], })
+            
+            # if 'flow' in self.hparams.stage:
+            #     wandb_logger.log({'val_images/x_t_seq': [wandb.Image(to_pil_image(create_grid(
+            #         torch.cat([elem[0].unsqueeze(0).to(torch.float32) for elem in x_t_seq], dim=0).clip(0, 1),
+            #         num_images=len(x_t_seq))))], 'val_images/source_distribution_samples': [
+            #         wandb.Image(to_pil_image(create_grid(source_dist_samples.clip(0, 1).to(torch.float32))))]})
+            #     if self.mmse_model is not None:
+            #         xhat_mmse = self.mmse_model(y).clip(0, 1)
+            #         wandb_logger.log({'val_images/xhat_mmse': [
+            #             wandb.Image(to_pil_image(create_grid(xhat_mmse.to(torch.float32))))]})
 
     def on_validation_epoch_end(self):
         if 'flow' in self.hparams.stage:
-            inception_score_mean, inception_score_std = self.inception_score.compute()
-            self.log_dict(
-                {'val_metrics/fid': self.fid.compute(),
-                 'val_metrics/inception_score_mean': inception_score_mean,
-                 'val_metrics/inception_score_std': inception_score_std},
-                on_epoch=True, on_step=False, sync_dist=True,
-                batch_size=1)
-            self.fid.reset()
-            self.inception_score.reset()
+            pass
+            # inception_score_mean, inception_score_std = self.inception_score.compute()
+            # TODO
+            # self.log_dict(
+            #     {'val_metrics/fid': self.fid.compute(),
+            #      'val_metrics/inception_score_mean': inception_score_mean,
+            #      'val_metrics/inception_score_std': inception_score_std},
+            #     on_epoch=True, on_step=False, sync_dist=True,
+            #     batch_size=1)
+            # self.fid.reset()
+
+            # self.inception_score.reset()
 
     def test_step(self, batch, batch_idx):
         assert self.test_results_path is not None, "Please set test_results_path before testing."
@@ -280,10 +300,10 @@ class MMSERectifiedFlow(LightningModule,
                 save_image(images[i].clip(0, 1), os.path.join(folder, image_file_names[i]))
 
         os.makedirs(self.test_results_path, exist_ok=True)
-        x = batch['x']
-        y = batch['y']
+        x = batch[clean_latent_key]
+        y = batch[broken_latent_key]
         non_noisy_z0 = batch['non_noisy_z0'] if 'non_noisy_z0' in batch else None
-        y_path = os.path.join(self.test_results_path, 'y')
+        y_path = os.path.join(self.test_results_path, clean_latent_key)
         save_image_batch(y, y_path, batch['img_file_name'])
 
         if 'flow' in self.hparams.stage:
