@@ -327,7 +327,7 @@ def define_2DAE(in_channels=3,  out_channels=2, latent_channels = 16):
     # layers_per_block = 3
     
     block_out_channels=(128, 128, 256)  # (256, 512)
-    layers_per_block = 3
+    layers_per_block = 2 # (2,2,3)
 
     # block_out_channels=(64, 128, 256) # 128, 256
     # layers_per_block = 2

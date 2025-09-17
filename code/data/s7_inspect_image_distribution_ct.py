@@ -89,10 +89,21 @@ for i in range(num_samples):
     axes_max[i].set_title(f"Residual {i} (min–max)")
     axes_max[i].axis("off")
 
+    CT = cv2.imread(ct_path, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+    CTC = cv2.imread(ctc_path, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+
+
+    CT = (CT - CT.min()) / (CT.max() - CT.min() + 1e-8)
+    CTC = (CTC - CTC.min()) / (CTC.max() - CTC.min() + 1e-8)
+
+
     # --- Method 2: Z-score standardization ---
+    # CT_std  = (CT - CT.mean()) / (CT.std() + 1e-8)
     CT_std  = (CT - CT.mean()) / (CT.std() + 1e-8)
     CTC_std = (CTC - CTC.mean()) / (CTC.std() + 1e-8)
     residual_std = CTC_std - CT_std
+
+
     # residual_std = residual_std  # * CTC.std()  + CTC.mean()  # scale back to original range
     print("Stat of residual (std):", residual_std.min(), residual_std.max(), residual_std.mean(), residual_std.std())
 
