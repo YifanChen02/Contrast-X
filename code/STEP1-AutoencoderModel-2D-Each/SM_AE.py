@@ -71,14 +71,6 @@ class AutoencoderKL_single_encoder(AutoencoderKL):
         
         self.num_encode = num_encode
 
-        # Duplicate encoders
-        # self.encoders    = nn.ModuleList([self._build_encoder_copy() for _ in range(num_encode)])
-        # self.quant_convs = nn.ModuleList(
-        #     [self._build_conv_copy(self.quant_conv) for _ in range(num_encode)]
-        # )
-        # self.post_quant_convs = nn.ModuleList(
-        #     [self._build_conv_copy(self.post_quant_conv) for _ in range(num_encode)]
-        # )
 
 
     def _build_encoder_copy(self):

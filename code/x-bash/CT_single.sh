@@ -1,6 +1,6 @@
 
 cd /home/hao/repo/FM-translation
-cd /home/hao/repo/FM-translation/code/STEP1-AutoencoderModel-2D
+cd /home/hao/repo/FM-translation/code/STEP1-AutoencoderModel-2D-Each
 
 
 
@@ -13,21 +13,34 @@ temp=/date/hao/FM
 
 # -------------------- Train 2DAE -----------------------
 cd /home/hao/repo/FM-translation/code/STEP1-AutoencoderModel-2D-Each
-gpu=5,6,7
+gpu=6
 
 data_files=../data/files/2D_CT_pair.csv
 aekl_ckpt=/date/hao/FM/checkpoint/CT/AE/ae-127-CT-CTC.pth
 
 output_dir=${temp}/checkpoint/CT/2D_AE  
-output_dir=${temp}/checkpoint/CT/2D_AE_smaller_8
+output_dir=${temp}/checkpoint/CT/2D_AE_single
 
 CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 --main_process_port 19360 \
-      train_2D_ct_autoencoder.py --gpu $gpu  \
+      train_2D_ct_single_autoencoder_mix.py --gpu $gpu  \
       --dataset_csv $data_files   --task  $task \
       --batch_size 12  --n_epochs  200    --lr 3e-4 \
       --cache_dir  ${temp}/cache/CT_all     \
       --input_modality   CT CTC    --missing_modality   CTC  \
       --output_dir  $output_dir  
+
+
+CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 --main_process_port 19360 \
+      train_2D_ct_single_autoencoder_mix.py --gpu $gpu  \
+      --dataset_csv $data_files   --task  $task \
+      --batch_size 6  --n_epochs  200    --lr 3e-4 \
+      --cache_dir  ${temp}/cache/CT_all     \
+      --input_modality   CT CTC    --missing_modality   CTC  \
+      --output_dir  $output_dir  
+
+
+
+
 
 CUDA_VISIBLE_DEVICES=$gpu accelerate launch --multi_gpu --mixed_precision fp16 --main_process_port 19360 \
       train_2D_ct_autoencoder_mix.py --gpu $gpu  \

@@ -512,7 +512,7 @@ def images_to_tensorboard(
             diffusion=diffusion,
             x0=x0, #inputs_latents,
             x1=x1,
-            num_inference_steps=200,
+            num_inference_steps=100,
             device=DEVICE,
             scale_factor=scale_factor,
             epoch=epoch
@@ -879,7 +879,13 @@ if __name__ == '__main__':
                     pred = diffusion(xt, t) #x=xt, timesteps=t, context=None)
 
                     # mse_loss = F.mse_loss(pred, ut)  # MSE Loss
-                    mse_loss = charbonnier_smooth_l1_loss(pred, ut)
+                    # mse_loss = charbonnier_smooth_l1_loss(pred, ut)
+
+                    sq_error = (pred - ut) ** 2   # shape [B, C, H, W]
+                    perc_error_map = sq_error / (ut ** 2 + 1e-8)   # [%]
+                    mse_loss = perc_error_map.mean()  * 0.01       # average over all voxels
+
+
 
                     t = t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
                     x1_pred = xt + (1-t) * pred
@@ -919,7 +925,9 @@ if __name__ == '__main__':
 
 
 
-                    rec_loss = F.mse_loss(pred, ut)   #0.1 * compute_mmd(x1_pred, x1)
+                    rec_loss = F.mse_loss(pred, ut)   
+                    
+                    #0.1 * compute_mmd(x1_pred, x1)
                     # loss_mmd = compute_mmd(z1_to_2, z2)
 
                     loss += mse_loss + rec_loss
