@@ -1,4 +1,4 @@
-# paired-contrast dataset/benchmark and model with flow-matching in medical image translation
+# PairedContrast
 
 # Contents
 - [Dataset & Structure](#dataset--structure)
