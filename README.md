@@ -1,4 +1,4 @@
-# flow-matching-medical-image-translation
+# paired-contrast dataset/benchmark and model with flow-matching in medical image translation
 
 # Contents
 - [Dataset & Structure](#dataset--structure)
